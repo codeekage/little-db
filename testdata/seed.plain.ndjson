@@ -1,0 +1,9 @@
+{"op":"put","key":"user:1","value":"{\"name\":\"Alice\",\"age\":30,\"role\":\"admin\"}"}
+{"op":"put","key":"user:2","value":"{\"name\":\"Bob\",\"age\":25,\"role\":\"editor\"}"}
+{"op":"put","key":"user:3","value":"{\"name\":\"Carol\",\"age\":41,\"role\":\"viewer\"}"}
+{"op":"put","key":"user:4","value":"{\"name\":\"Dan\",\"age\":19,\"role\":\"viewer\"}"}
+{"op":"put","key":"post:1","value":"{\"title\":\"Hello\",\"body\":\"first post\",\"author\":\"user:1\"}"}
+{"op":"put","key":"post:2","value":"{\"title\":\"Hi again\",\"body\":\"second post\",\"author\":\"user:2\"}"}
+{"op":"put","key":"flag:beta","value":"true"}
+{"op":"put","key":"flag:dark-mode","value":"false"}
+{"op":"delete","key":"flag:dark-mode"}

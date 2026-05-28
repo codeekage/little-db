@@ -1,0 +1,10 @@
+{"op":"put","key":"user:1","value":"{\"id\":1,\"name\":\"User 1\",\"email\":\"user1@example.com\",\"age\":19,\"role\":\"editor\"}"}
+{"op":"put","key":"user:2","value":"{\"id\":2,\"name\":\"User 2\",\"email\":\"user2@example.com\",\"age\":20,\"role\":\"viewer\"}"}
+{"op":"put","key":"user:3","value":"{\"id\":3,\"name\":\"User 3\",\"email\":\"user3@example.com\",\"age\":21,\"role\":\"admin\"}"}
+{"op":"put","key":"user:4","value":"{\"id\":4,\"name\":\"User 4\",\"email\":\"user4@example.com\",\"age\":22,\"role\":\"editor\"}"}
+{"op":"put","key":"user:5","value":"{\"id\":5,\"name\":\"User 5\",\"email\":\"user5@example.com\",\"age\":23,\"role\":\"viewer\"}"}
+{"op":"put","key":"user:6","value":"{\"id\":6,\"name\":\"User 6\",\"email\":\"user6@example.com\",\"age\":24,\"role\":\"admin\"}"}
+{"op":"put","key":"user:7","value":"{\"id\":7,\"name\":\"User 7\",\"email\":\"user7@example.com\",\"age\":25,\"role\":\"editor\"}"}
+{"op":"put","key":"user:8","value":"{\"id\":8,\"name\":\"User 8\",\"email\":\"user8@example.com\",\"age\":26,\"role\":\"viewer\"}"}
+{"op":"put","key":"user:9","value":"{\"id\":9,\"name\":\"User 9\",\"email\":\"user9@example.com\",\"age\":27,\"role\":\"admin\"}"}
+{"op":"put","key":"user:10","value":"{\"id\":10,\"name\":\"User 10\",\"email\":\"user10@example.com\",\"age\":28,\"role\":\"editor\"}"}
