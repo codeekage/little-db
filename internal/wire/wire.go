@@ -29,6 +29,8 @@
 //	                       slen=0 means "open start"; elen=0 means "open end"
 //	0x06 PING            (empty body)
 //	0x07 STATS           (empty body)
+//	0x08 REPLICATE_SUBSCRIBE  u32 tag_len | resume_tag   (follower→leader)
+//	0x09 REPLICATE_RECORD     bytes(record)              (leader→follower)
 //
 // Statuses (response tags):
 //
@@ -38,6 +40,7 @@
 //	0x03 INTERNAL
 //	0x04 CLOSED
 //	0x05 OVERLOAD
+//	0x06 FOLLOWER_READ_ONLY
 //
 // Non-OK responses carry an error envelope as their body:
 //
@@ -135,6 +138,10 @@ func (o Op) String() string {
 		return "PING"
 	case OpStats:
 		return "STATS"
+	case OpReplicateSubscribe:
+		return "REPLICATE_SUBSCRIBE"
+	case OpReplicateRecord:
+		return "REPLICATE_RECORD"
 	default:
 		return "UNKNOWN"
 	}
@@ -167,6 +174,8 @@ func (s Status) String() string {
 		return "CLOSED"
 	case StatusOverload:
 		return "OVERLOAD"
+	case StatusFollowerReadOnly:
+		return "FOLLOWER_READ_ONLY"
 	default:
 		return "UNKNOWN"
 	}

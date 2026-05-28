@@ -110,6 +110,8 @@ func DecodeRequest(op Op, body []byte) (Request, error) {
 			return nil, asProtocolErr("STATS: expected empty body, got %d bytes", len(body))
 		}
 		return &StatsRequest{}, nil
+	case OpReplicateSubscribe:
+		return decodeReplicateSubscribe(body)
 	default:
 		return nil, asProtocolErr("unknown opcode 0x%02x", uint8(op))
 	}
