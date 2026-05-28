@@ -1077,3 +1077,261 @@ func equalStringSets(got, want []string) bool {
 // Compile-time guard that we don't accidentally remove the atomic import
 // (kept for symmetry with engine tests that rely on it).
 var _ = atomic.Int64{}
+
+// --- 7. Follower mode + dial loop ----------------------------------------
+
+// TestServerFollowerModeRejectsWrites verifies the dispatchOnce gate:
+// when FollowerMode is on, every mutating op gets StatusFollowerReadOnly
+// with a message that includes the leader address, while reads pass
+// through. This is the "safety net" half of follower mode; the apply
+// loop is the "useful work" half (covered below).
+func TestServerFollowerModeRejectsWrites(t *testing.T) {
+	_, addr := startServer(t, func(o *Options) {
+		o.FollowerMode = true
+		o.LeaderAddr = "leader.example:4242"
+	})
+	conn := dial(t, addr)
+
+	for _, tc := range []struct {
+		name string
+		req  wire.Request
+	}{
+		{"PUT", &wire.PutRequest{Key: []byte("k"), Value: []byte("v")}},
+		{"DELETE", &wire.DeleteRequest{Key: []byte("k")}},
+		{"BATCH", &wire.BatchRequest{Entries: []wire.BatchEntry{{Key: []byte("k"), Value: []byte("v")}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st, body := roundTrip(t, conn, tc.req)
+			if st != wire.StatusFollowerReadOnly {
+				t.Fatalf("got status %v want FOLLOWER_READ_ONLY", st)
+			}
+			msg, err := wire.DecodeError(body)
+			if err != nil {
+				t.Fatalf("DecodeError: %v", err)
+			}
+			if !bytes.Contains([]byte(msg), []byte("leader.example:4242")) {
+				t.Fatalf("msg %q should mention leader address", msg)
+			}
+		})
+	}
+
+	// Reads still work.
+	st, _ := roundTrip(t, conn, &wire.PingRequest{})
+	if st != wire.StatusOK {
+		t.Fatalf("PING in follower mode: got %v want OK", st)
+	}
+	st, _ = roundTrip(t, conn, &wire.GetRequest{Key: []byte("missing")})
+	if st != wire.StatusNotFound {
+		t.Fatalf("GET in follower mode: got %v want NOT_FOUND", st)
+	}
+}
+
+// openFollowerDB opens a fresh engine without replication. Tests use it
+// as the "apply target" for a Follower.
+func openFollowerDB(t *testing.T) *engine.DB {
+	t.Helper()
+	db, err := engine.Open(engine.Options{
+		Dir:                 t.TempDir(),
+		MaxBatchEncodedSize: 16 * 1024 * 1024,
+	})
+	if err != nil {
+		t.Fatalf("engine.Open follower: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// TestFollowerLoopAppliesStream is the end-to-end happy path: spin up a
+// leader with replication enabled, point a Follower at it, write 3 keys
+// on the leader, assert all 3 appear on the follower within a short
+// deadline. This validates dial → subscribe → ack → apply round-trip.
+func TestFollowerLoopAppliesStream(t *testing.T) {
+	_, leaderDB, leaderAddr := startReplicationServer(t, 64)
+	followerDB := openFollowerDB(t)
+
+	follower := NewFollower(leaderAddr, followerDB, FollowerOptions{
+		InitialBackoff:      10 * time.Millisecond,
+		MaxBackoff:          50 * time.Millisecond,
+		SubscribeAckTimeout: 2 * time.Second,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- follower.Run(ctx) }()
+
+	// The publisher drops records when no subscriber is attached, so
+	// we can't write once and wait. Instead, write a key in a loop
+	// and poll the follower until it observes the value; this races
+	// the subscriber-attach without depending on internal signals.
+	putUntilApplied := func(t *testing.T, key, val string) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if err := leaderDB.Put([]byte(key), []byte(val)); err != nil {
+				t.Fatalf("leader put %s: %v", key, err)
+			}
+			got, err := followerDB.Get([]byte(key))
+			if err == nil && bytes.Equal(got, []byte(val)) {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("follower never observed key %s", key)
+	}
+
+	for _, k := range []string{"a", "b", "c"} {
+		putUntilApplied(t, k, "v-"+k)
+	}
+
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run returned %v, want nil after ctx cancel", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Run did not return after ctx cancel")
+	}
+}
+
+// waitForApplied writes key=val repeatedly until the follower observes
+// the value, or fails the test. The publisher drops records when no
+// subscriber is attached, so a one-shot write can race the subscribe
+// handshake; the retry pattern is the cheapest way to bridge that.
+func waitForApplied(t *testing.T, leader, follower *engine.DB, key, val string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := leader.Put([]byte(key), []byte(val)); err != nil {
+			t.Fatalf("leader put: %v", err)
+		}
+		got, err := follower.Get([]byte(key))
+		if err == nil && bytes.Equal(got, []byte(val)) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("follower never observed key %s=%s", key, val)
+}
+
+// TestFollowerLoopReconnectsAfterDisconnect kills the leader-side conn
+// once and verifies the follower reconnects and resumes applying. We
+// don't have a "kick the subscriber" op, so we restart the whole
+// leader: shutdown, then bring up a fresh one on the same address.
+// Reusing the same listener port across two Bind calls is racy, so
+// instead the leader stays up and we close its single subscriber by
+// shutting the server down hard and re-binding; that's complex enough
+// that this test instead just observes one round of reconnect by
+// pointing the follower at a temporarily-closed port and asserting
+// no permanent failure once the leader comes up.
+func TestFollowerLoopReconnectsAfterDisconnect(t *testing.T) {
+	// Reserve a port by binding+closing a listener, then bring up the
+	// leader at the same address shortly after the follower has tried
+	// (and failed) to dial.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := l.Addr().String()
+	_ = l.Close()
+
+	followerDB := openFollowerDB(t)
+	follower := NewFollower(addr, followerDB, FollowerOptions{
+		DialTimeout:         200 * time.Millisecond,
+		InitialBackoff:      20 * time.Millisecond,
+		MaxBackoff:          100 * time.Millisecond,
+		SubscribeAckTimeout: 1 * time.Second,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- follower.Run(ctx) }()
+
+	// Let the follower fail at least once.
+	time.Sleep(100 * time.Millisecond)
+
+	// Now bring the leader up on the same address. startReplicationServer
+	// uses 127.0.0.1:0; we need to bind specifically, so do it inline.
+	dir := t.TempDir()
+	leaderDB, err := engine.Open(engine.Options{
+		Dir:                   dir,
+		MaxBatchEncodedSize:   16 * 1024 * 1024,
+		ReplicationBufferSize: 64,
+	})
+	if err != nil {
+		t.Fatalf("leader engine.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = leaderDB.Close() })
+
+	srv := New(leaderDB, Options{
+		Addr:                      addr,
+		ReadDeadline:              2 * time.Second,
+		WriteDeadline:             2 * time.Second,
+		MaxConcurrentRangeStreams: 4,
+		MaxRangeResponseBytes:     64 * 1024 * 1024,
+		EnableReplication:         true,
+	})
+	if err := srv.Bind(); err != nil {
+		t.Fatalf("leader Bind: %v", err)
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve() }()
+	t.Cleanup(func() {
+		shutCtx, c := context.WithTimeout(context.Background(), 2*time.Second)
+		defer c()
+		_ = srv.Shutdown(shutCtx)
+		<-serveErr
+	})
+
+	waitForApplied(t, leaderDB, followerDB, "reconnect", "ok")
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Run did not return after ctx cancel")
+	}
+}
+
+// TestFollowerRunReturnsOnDBClose verifies that closing the local DB
+// during a live session causes Run to return ErrDBClosed (terminal) so
+// the CLI knows to exit instead of looping forever.
+func TestFollowerRunReturnsOnDBClose(t *testing.T) {
+	_, leaderDB, leaderAddr := startReplicationServer(t, 64)
+	followerDB := openFollowerDB(t)
+
+	follower := NewFollower(leaderAddr, followerDB, FollowerOptions{
+		InitialBackoff:      10 * time.Millisecond,
+		MaxBackoff:          50 * time.Millisecond,
+		SubscribeAckTimeout: 2 * time.Second,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- follower.Run(ctx) }()
+
+	waitForApplied(t, leaderDB, followerDB, "k", "v")
+
+	if err := followerDB.Close(); err != nil {
+		t.Fatalf("followerDB.Close: %v", err)
+	}
+	// Need to keep writing so the follower's read loop sees a record
+	// to apply, which triggers ErrDBClosed.
+	for i := 0; i < 20; i++ {
+		if err := leaderDB.Put([]byte("k"+strconv.Itoa(i)), []byte("v")); err != nil {
+			// engine may already be torn down; ignore.
+			break
+		}
+		select {
+		case err := <-runDone:
+			if !errors.Is(err, engine.ErrDBClosed) {
+				t.Fatalf("Run returned %v, want ErrDBClosed", err)
+			}
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	t.Fatalf("Run did not return ErrDBClosed after follower DB close")
+}

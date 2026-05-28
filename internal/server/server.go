@@ -92,6 +92,24 @@ type Options struct {
 	// tell server-side vs engine-side misconfiguration apart.
 	EnableReplication bool
 
+	// FollowerMode rejects every mutating request (PUT, DELETE,
+	// BATCH_PUT) with StatusFollowerReadOnly. Reads (GET, RANGE,
+	// STATS, PING) and the replication endpoint are unaffected. Set
+	// by an operator that wires a separate Follower runner to apply
+	// records from a leader; the engine layer has no notion of
+	// leader vs follower, so the server-side gate is what prevents a
+	// client from racing the replication apply path and silently
+	// diverging the follower from the leader (which would also break
+	// the lastTstamp ratchet).
+	FollowerMode bool
+
+	// LeaderAddr is included verbatim in the FOLLOWER_READ_ONLY
+	// error message so a client can rediscover the writable node
+	// without out-of-band coordination. Empty when FollowerMode is
+	// false; the field is informational only — the server never
+	// dials it.
+	LeaderAddr string
+
 	// Logger receives lifecycle events (listen, shutdown) at Info and,
 	// when Debug is enabled, one line per request (op, sizes, status,
 	// duration). Nil installs a no-op logger; the per-request hot path
@@ -418,6 +436,25 @@ func (s *Server) dispatch(conn net.Conn, req wire.Request) error {
 // what the client will observe; transport errors mean the response did
 // not reach the wire.
 func (s *Server) dispatchOnce(conn net.Conn, req wire.Request) (wire.Status, error) {
+	// Follower-mode write gate. The check lives here, not in the
+	// engine, because the engine has no notion of leader/follower
+	// roles — it just executes writes. A client write that bypassed
+	// this gate would land via the writer goroutine just like any
+	// other Put, bumping lastTstamp from local wall clock and
+	// silently shifting the follower out of sync with the leader's
+	// timestamp ratchet. The mutating opcodes are listed explicitly
+	// (rather than a default-rejecting fallthrough) so a future
+	// read-only opcode does not need to remember to opt in.
+	if s.opts.FollowerMode {
+		switch req.(type) {
+		case *wire.PutRequest, *wire.DeleteRequest, *wire.BatchRequest:
+			msg := "follower read-only"
+			if s.opts.LeaderAddr != "" {
+				msg = "follower read-only; leader at " + s.opts.LeaderAddr
+			}
+			return wire.StatusFollowerReadOnly, s.writeError(conn, wire.StatusFollowerReadOnly, msg)
+		}
+	}
 	switch r := req.(type) {
 	case *wire.PutRequest:
 		if err := s.db.Put(r.Key, r.Value); err != nil {

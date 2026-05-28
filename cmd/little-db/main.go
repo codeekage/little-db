@@ -135,6 +135,10 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 	compactionInterval := fs.Duration("compaction-interval", 0,
 		"background compaction interval (0 disables)")
 
+	// Replication / follower knobs.
+	replicaOf := fs.String("replica-of", "",
+		"leader address; when set this server runs as a read-only follower and applies the leader's stream")
+
 	// Observability knobs.
 	logLevel := fs.String("log-level", "info",
 		"log level: debug|info|warn|error (debug enables per-request logs)")
@@ -187,14 +191,39 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		WriteDeadline:             *writeDeadline,
 		MaxConcurrentRangeStreams: *maxRangeStreams,
 		MaxRangeResponseBytes:     *maxRangeBytes,
+		FollowerMode:              *replicaOf != "",
+		LeaderAddr:                *replicaOf,
 		Logger:                    logger,
 	})
 	if err := srv.Bind(); err != nil {
 		fmt.Fprintf(stderr, "little-db serve: bind %s: %v\n", *addr, err)
 		return exitTransport
 	}
-	fmt.Fprintf(stdout, "little-db: listening on %s (data-dir=%s)\n",
-		srv.Addr(), *dataDir)
+	if *replicaOf != "" {
+		fmt.Fprintf(stdout, "little-db: listening on %s (data-dir=%s, replica-of=%s)\n",
+			srv.Addr(), *dataDir, *replicaOf)
+	} else {
+		fmt.Fprintf(stdout, "little-db: listening on %s (data-dir=%s)\n",
+			srv.Addr(), *dataDir)
+	}
+
+	// Spawn the follower runner if --replica-of is set. It runs as a
+	// sibling of the server: the server answers reads (and rejects
+	// writes with FOLLOWER_READ_ONLY), the follower applies the
+	// leader's stream into the same engine. Both share the same
+	// shutdown context so a single SIGINT brings them both down.
+	followerCtx, followerCancel := context.WithCancel(context.Background())
+	defer followerCancel()
+	followerDone := make(chan struct{})
+	if *replicaOf != "" {
+		follower := server.NewFollower(*replicaOf, db, server.FollowerOptions{Logger: logger})
+		go func() {
+			defer close(followerDone)
+			_ = follower.Run(followerCtx)
+		}()
+	} else {
+		close(followerDone)
+	}
 
 	// Serve in a goroutine; signal handler triggers Shutdown.
 	serveErr := make(chan error, 1)
@@ -210,18 +239,22 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		// hard-kills the process instead of being absorbed.
 		stop()
 		fmt.Fprintln(stdout, "little-db: shutting down")
+		followerCancel()
 		shutCtx, cancel := context.WithTimeout(context.Background(), *shutdownGrace)
 		defer cancel()
 		if err := srv.Shutdown(shutCtx); err != nil {
 			fmt.Fprintf(stderr, "little-db serve: shutdown: %v\n", err)
-			// Drain Serve's return so the goroutine exits cleanly.
 			<-serveErr
+			<-followerDone
 			return exitTransport
 		}
 		<-serveErr
+		<-followerDone
 		return exitOK
 	case err := <-serveErr:
 		// Serve returned on its own — listener died unexpectedly.
+		followerCancel()
+		<-followerDone
 		if err != nil {
 			fmt.Fprintf(stderr, "little-db serve: %v\n", err)
 			return exitTransport
