@@ -557,6 +557,15 @@ func classifyEngineErr(err error) (wire.Status, string) {
 		return wire.StatusNotFound, ""
 	case errors.Is(err, engine.ErrDBClosed):
 		return wire.StatusClosed, err.Error()
+	case errors.Is(err, engine.ErrWritesDisabled):
+		// Engine has stopped accepting writes after an uncertain
+		// manifest publish (see engine.rotateActive). Operationally
+		// this is the same shape as a closed engine from the client's
+		// perspective — the DB is up enough to answer, but won't
+		// accept writes — so reuse StatusClosed rather than reporting
+		// a generic INTERNAL. The full error string carries the
+		// distinguishing detail for human operators.
+		return wire.StatusClosed, err.Error()
 	case errors.Is(err, engine.ErrEmptyKey),
 		errors.Is(err, engine.ErrKeyTooLarge),
 		errors.Is(err, engine.ErrValueTooLarge),

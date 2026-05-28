@@ -93,6 +93,18 @@ var (
 	// underlying error (errors.Is) and identify the offending entry index from
 	// the wrapped message.
 	ErrInvalidBatchEntry = errors.New("engine: invalid batch entry")
+
+	// ErrWritesDisabled is returned by Put / Delete / BatchPut after the
+	// engine has entered a fatal write-disabled state. It is set when a
+	// manifest publish reaches ErrManifestPublishedButUncertain during
+	// segment rotation: the directory fsync did not confirm, so the
+	// running process cannot safely accept further writes that depend on
+	// the new active segment being durable. Reads continue to succeed
+	// from the prior sealed segments. The operator should stop the
+	// process, let the kernel finish flushing (or accept the loss), and
+	// restart — Open's sweepOrphans will reconcile whichever side of
+	// the rename survived.
+	ErrWritesDisabled = errors.New("engine: writes disabled (manifest durability uncertain)")
 )
 
 // BatchEntry is one operation inside a BatchPut. A non-Delete entry writes
@@ -261,6 +273,14 @@ type DB struct {
 	closed    atomic.Bool
 	closeOnce sync.Once
 	closeErr  error // first-call error, returned by every subsequent Close
+
+	// writesDisabled is set when rotateActive hits
+	// ErrManifestPublishedButUncertain. From that moment on submit returns
+	// ErrWritesDisabled instead of forwarding the request to the writer.
+	// Once true it never reverts; the operator must restart the process
+	// so Open can reconcile the manifest on disk. Reads are unaffected
+	// and continue to serve from the prior sealed segments.
+	writesDisabled atomic.Bool
 
 	// cachedStats holds the last Stats snapshot, captured by Close just
 	// before db.segments is nilled out. Stats() returns this value after
@@ -651,6 +671,15 @@ func (db *DB) submit(req *writeRequest) error {
 		db.submitMu.RUnlock()
 		return ErrDBClosed
 	}
+	// Fatal write-disable from a prior uncertain manifest publish (see
+	// rotateActive). Reject before enqueue so callers fail fast and the
+	// writer goroutine is not asked to do work it has already proven
+	// cannot be made durable. Compaction-commit requests are also
+	// gated: any further manifest writes would compound the uncertainty.
+	if db.writesDisabled.Load() {
+		db.submitMu.RUnlock()
+		return ErrWritesDisabled
+	}
 	db.reqCh <- req
 	db.submitMu.RUnlock()
 	return <-req.reply
@@ -1039,6 +1068,15 @@ func (db *DB) processBurst(burst []*writeRequest) {
 // on the burst's active-segment fsync for durability). A successful
 // compaction commit, which writes only the manifest, returns false.
 func (db *DB) handleOne(req *writeRequest) (bool, error) {
+	// Sticky write-disable from a prior uncertain manifest publish.
+	// submit() rejects new arrivals, but a burst already drained from
+	// reqCh bypasses that gate, so every request in the burst must
+	// re-check the flag before touching segments or the keydir. Any
+	// further append (or rotation, or compact commit) would compound
+	// the durability uncertainty we already cannot recover from.
+	if db.writesDisabled.Load() {
+		return false, ErrWritesDisabled
+	}
 	if req.kind == writeKindBatch {
 		return db.handleBatch(req)
 	}
@@ -1200,9 +1238,11 @@ func (db *DB) handleBatch(req *writeRequest) (bool, error) {
 // BEFORE any append lands on it. Otherwise a host crash after the first
 // acked write to the new segment would lose data on restart — the new id
 // would not be in the manifest and reconcileManifest would treat the file
-// as an orphan. We therefore: create the file, write the manifest with the
-// new id appended, then publish under segmentsMu. The manifest write is
-// the durability barrier; an O(N) JSON serialization per rotation is
+// as an orphan. We therefore: create the file, fsync the data directory so
+// the new .seg dirent is durable (syncDir, pre-manifest barrier), write
+// the manifest with the new id appended, then publish under segmentsMu.
+// The pre-manifest syncDir + the manifest tmp→rename→dir-fsync together
+// form the durability barrier; an O(N) JSON serialization per rotation is
 // trivial against the cost of the new-file fsync and is amortised over
 // many writes per segment.
 func (db *DB) rotateActive() error {
@@ -1213,6 +1253,22 @@ func (db *DB) rotateActive() error {
 	next, err := createSegment(db.opts.Dir, nextID)
 	if err != nil {
 		return err
+	}
+	// Durably commit the new .seg dirent BEFORE publishing the manifest.
+	// createSegment only fsyncs the file's existence implicitly via
+	// subsequent operations; without an explicit parent-dir fsync here
+	// the manifest can land referencing next.id while the .seg dirent is
+	// still in a writeback buffer. A host crash in that window leaves the
+	// manifest pointing at a file the kernel never persisted — Open then
+	// fails with "manifest live segment missing".
+	dirSyncErr := syncDir(db.opts.Dir)
+	if hook := testRotatePreManifestSyncHook; hook != nil && dirSyncErr == nil {
+		dirSyncErr = hook()
+	}
+	if dirSyncErr != nil {
+		_ = next.close()
+		_ = os.Remove(next.path)
+		return fmt.Errorf("rotate: fsync data dir before manifest: %w", dirSyncErr)
 	}
 	// Compute the new live set under the segments RLock so we observe a
 	// consistent snapshot. The set includes the about-to-be-published new
@@ -1226,6 +1282,37 @@ func (db *DB) rotateActive() error {
 	db.segmentsMu.RUnlock()
 	live = append(live, next.id)
 	if err := writeManifest(db.opts.Dir, live, next.id); err != nil {
+		if errors.Is(err, ErrManifestPublishedButUncertain) {
+			// The new MANIFEST is visible on disk and references
+			// next.id, but the directory fsync did NOT confirm. A
+			// host crash here can revert the rename, in which case
+			// the previous manifest stands and any record we wrote
+			// into next would become orphan data the next Open's
+			// sweepOrphans would discard — silent loss of an
+			// acknowledged write.
+			//
+			// We cannot unlink next.path either: if the rename
+			// held, the manifest still references next.id and
+			// unlinking it would turn a recoverable durability gap
+			// into permanent corruption.
+			//
+			// The only safe action is to enter a fatal write-
+			// disabled state. next.path stays on disk; we close
+			// our fd and do NOT install next as the active
+			// segment, so no further writes can land in it.
+			// Reads continue to serve from the prior sealed
+			// segments. The operator restarts; Open's
+			// sweepOrphans reconciles whichever side of the
+			// rename survived.
+			_ = next.close()
+			db.writesDisabled.Store(true)
+			db.log.Error("manifest published with uncertain durability; disabling writes",
+				slog.String("op", "rotate"),
+				slog.Uint64("new_active_id", uint64(next.id)),
+				slog.String("path", next.path),
+				slog.String("err", err.Error()))
+			return fmt.Errorf("rotate: %w: %v", ErrWritesDisabled, err)
+		}
 		_ = next.close()
 		_ = os.Remove(next.path)
 		return fmt.Errorf("rotate: persist manifest: %w", err)
