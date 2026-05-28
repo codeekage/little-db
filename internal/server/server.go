@@ -80,6 +80,18 @@ type Options struct {
 	// default (64 MiB).
 	MaxRangeResponseBytes int64
 
+	// EnableReplication exposes the REPLICATE_SUBSCRIBE endpoint. When
+	// false (default) the server rejects subscribe requests with
+	// BAD_REQUEST regardless of the underlying engine's replication
+	// configuration — operators must opt in at the server boundary
+	// because exposing the change stream is a security-sensitive
+	// capability (every write becomes externally readable). When true,
+	// the engine must also be opened with Options.ReplicationBufferSize
+	// > 0; if it is not, subscribe still fails with BAD_REQUEST (the
+	// distinction surfaces in the error message) so the operator can
+	// tell server-side vs engine-side misconfiguration apart.
+	EnableReplication bool
+
 	// Logger receives lifecycle events (listen, shutdown) at Info and,
 	// when Debug is enabled, one line per request (op, sizes, status,
 	// duration). Nil installs a no-op logger; the per-request hot path
@@ -437,17 +449,7 @@ func (s *Server) dispatchOnce(conn net.Conn, req wire.Request) (wire.Status, err
 		return s.handleRange(conn, r)
 
 	case *wire.ReplicateSubscribeRequest:
-		// Replication is documented in docs/replication.md and the
-		// codec already understands the opcode, but the leader-side
-		// publisher and subscribe handler land on a later commit on
-		// bonus/replication. Until then, surface a deliberate
-		// BAD_REQUEST so misconfigured followers get an actionable
-		// signal instead of INTERNAL. Keeping the codec dispatch in
-		// place (vs. returning "unknown opcode") preserves the
-		// reviewable diff: when the server-side handler lands, only
-		// this case body changes.
-		_ = r
-		return wire.StatusBadRequest, s.writeError(conn, wire.StatusBadRequest, "replication not enabled on this server")
+		return s.handleReplicateSubscribe(conn, r)
 	}
 	// Unknown concrete type; defensive.
 	return wire.StatusInternal, s.writeError(conn, wire.StatusInternal, "unknown request type")
@@ -590,5 +592,108 @@ func classifyEngineErr(err error) (wire.Status, string) {
 		return wire.StatusBadRequest, err.Error()
 	default:
 		return wire.StatusInternal, err.Error()
+	}
+}
+
+// handleReplicateSubscribe streams REPLICATE_RECORD frames to a follower
+// until the connection closes, the engine shuts down, or the server
+// drains. Unlike every other endpoint, this one holds the connection
+// for the lifetime of the subscription — it never returns control to
+// the per-connection request loop in a "ready for next request" state.
+// When it returns, handleConn loops back to ReadFrame; the next read
+// will see either EOF (clean follower disconnect) or hang briefly
+// before the ReadDeadline fires, after which handleConn exits and the
+// connection is closed.
+//
+// Error mapping:
+//
+//   - Server not opted in              → BAD_REQUEST ("server")
+//   - Non-empty resume tag             → BAD_REQUEST ("resume tag not supported")
+//   - Engine replication disabled      → BAD_REQUEST ("database")
+//   - Slot already taken               → OVERLOAD (single-subscriber design)
+//   - Engine closed                    → CLOSED
+//
+// Wire protocol on success:
+//
+//  1. Server writes one StatusOK frame (empty body) to ack the subscribe.
+//     Followers should treat this as "you are now the live subscriber".
+//  2. Server then writes zero or more REPLICATE_RECORD frames, one per
+//     leader write, in the order the leader's writer committed them.
+//  3. The stream ends with a clean connection close (DB shutdown,
+//     server drain, or transport error). There is no in-band "end of
+//     stream" frame — followers detect end via ReadFrame returning
+//     io.EOF.
+//
+// The per-frame WriteDeadline policy is the same as every other write:
+// reset immediately before the write. There is no overall stream
+// deadline; followers stay subscribed indefinitely.
+func (s *Server) handleReplicateSubscribe(conn net.Conn, req *wire.ReplicateSubscribeRequest) (wire.Status, error) {
+	if !s.opts.EnableReplication {
+		return wire.StatusBadRequest, s.writeError(conn, wire.StatusBadRequest, "replication not enabled on this server")
+	}
+	if len(req.ResumeTag) > 0 {
+		// v0.1.0 always streams from "now"; resume tags are reserved
+		// for a future snapshot-bootstrap path. Reject loudly rather
+		// than silently ignore: a follower that thinks it asked to
+		// resume from offset N but actually got "from now" would
+		// silently lose records.
+		return wire.StatusBadRequest, s.writeError(conn, wire.StatusBadRequest, "resume tag not supported in v0.1.0; send empty tag")
+	}
+	sub, err := s.db.Subscribe()
+	if err != nil {
+		switch {
+		case errors.Is(err, engine.ErrReplicationDisabled):
+			// Server flag is on but engine wasn't opened with a
+			// replication buffer — distinct from the server-flag-off
+			// case so operators can tell the two misconfigurations
+			// apart from the error message alone.
+			return wire.StatusBadRequest, s.writeError(conn, wire.StatusBadRequest, "replication not enabled on this database")
+		case errors.Is(err, engine.ErrAlreadySubscribed):
+			// Single-subscriber-per-DB is a deliberate v0.1.0 design
+			// choice (docs/replication.md §3.3). OVERLOAD matches the
+			// "capacity exhausted, retry later" shape we use for range
+			// streams; followers should back off and retry.
+			return wire.StatusOverload, s.writeError(conn, wire.StatusOverload, "replication slot busy; one follower at a time")
+		case errors.Is(err, engine.ErrDBClosed):
+			return wire.StatusClosed, s.writeError(conn, wire.StatusClosed, err.Error())
+		default:
+			return s.writeEngineErr(conn, err)
+		}
+	}
+	// sub.Close detaches and closes the channel. Safe to call even if
+	// the DB shutdown path already closed it (Close is idempotent).
+	defer sub.Close()
+
+	// Ack the subscribe so the follower can transition from
+	// "dialing/handshake" to "applying records".
+	if err := s.writeFrame(conn, uint8(wire.StatusOK), nil); err != nil {
+		return wire.StatusOK, err
+	}
+
+	// Stream loop. The connection is now dedicated to this stream until
+	// one of three things happens:
+	//
+	//   1. sub.Records() closes — DB.Close fired closeSubscriptionOnShutdown.
+	//   2. s.shutdownCh closes — server.Shutdown asked us to drain.
+	//   3. A write fails — follower disconnected or write deadline elapsed.
+	//
+	// In every case we return; handleConn observes EOF on its next read
+	// (or the conn is already torn down) and the per-connection
+	// goroutine exits.
+	for {
+		select {
+		case <-s.shutdownCh:
+			return wire.StatusOK, nil
+		case rec, ok := <-sub.Records():
+			if !ok {
+				return wire.StatusOK, nil
+			}
+			if err := conn.SetWriteDeadline(time.Now().Add(s.opts.WriteDeadline)); err != nil {
+				return wire.StatusOK, err
+			}
+			if err := wire.WriteReplicateRecord(conn, rec); err != nil {
+				return wire.StatusOK, err
+			}
+		}
 	}
 }

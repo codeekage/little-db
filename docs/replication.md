@@ -96,7 +96,7 @@ defects.
 
 The single substantive change to the engine is **step 4**: after a record
 is appended to the active segment, flushed to the kernel page cache, and
-made visible in the keydir — but *before* the burst's fsync — a copy of
+made visible in the keydir — but _before_ the burst's fsync — a copy of
 its encoded bytes is published to a buffered channel. The publish is
 non-blocking. If the channel is full, the record is dropped from the
 tail of the buffer and a `replication_lag_dropped` counter is

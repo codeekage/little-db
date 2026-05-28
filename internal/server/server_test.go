@@ -289,16 +289,13 @@ func TestServerBadFrameClassification(t *testing.T) {
 	}
 }
 
-// TestServerReplicateSubscribeBadRequest pins the placeholder dispatch
-// for REPLICATE_SUBSCRIBE while the leader-mode server-side handler is
-// staged on a later commit. Without an explicit case the request would
-// fall through to "unknown request type" / INTERNAL, which is wrong:
-// the opcode IS understood by the codec, the server simply does not
-// expose replication yet. Misconfigured followers should see a
-// deliberate BAD_REQUEST with an actionable message, not INTERNAL.
-// When the real handler lands the test should flip to assert OK and a
-// REPLICATE_RECORD stream.
-func TestServerReplicateSubscribeBadRequest(t *testing.T) {
+// TestServerReplicateSubscribeDisabledByDefault verifies that even when
+// the underlying engine has replication enabled, the server requires an
+// explicit opt-in (Options.EnableReplication) before exposing the
+// subscribe endpoint. Exposing the change stream is a security-sensitive
+// capability — every write becomes externally readable — so the server
+// boundary fails closed.
+func TestServerReplicateSubscribeDisabledByDefault(t *testing.T) {
 	_, addr := startServer(t, nil)
 	conn := dial(t, addr)
 
@@ -313,6 +310,239 @@ func TestServerReplicateSubscribeBadRequest(t *testing.T) {
 	if msg != "replication not enabled on this server" {
 		t.Fatalf("msg: got %q", msg)
 	}
+}
+
+// startReplicationServer is like startServer but opens the engine with
+// replication enabled (ReplicationBufferSize > 0, MaxBatchEncodedSize
+// lowered to satisfy the wire-frame cap) and turns on
+// Options.EnableReplication. The bufSize is exposed so drop-on-overflow
+// tests can request a tiny buffer.
+func startReplicationServer(t *testing.T, bufSize int) (*Server, *engine.DB, string) {
+	t.Helper()
+	dir := t.TempDir()
+	db, err := engine.Open(engine.Options{
+		Dir:                   dir,
+		MaxBatchEncodedSize:   16 * 1024 * 1024,
+		ReplicationBufferSize: bufSize,
+	})
+	if err != nil {
+		t.Fatalf("engine.Open: %v", err)
+	}
+	srv := New(db, Options{
+		Addr:                      "127.0.0.1:0",
+		ReadDeadline:              2 * time.Second,
+		WriteDeadline:             2 * time.Second,
+		MaxConcurrentRangeStreams: 4,
+		MaxRangeResponseBytes:     64 * 1024 * 1024,
+		EnableReplication:         true,
+	})
+	if err := srv.Bind(); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	addr := srv.Addr().String()
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve() }()
+
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		<-serveErr
+		_ = db.Close()
+	})
+	return srv, db, addr
+}
+
+// TestServerReplicateSubscribeStreamsRecords is the happy-path e2e: a
+// follower subscribes, the leader writes, and the records arrive in
+// order, framed as REPLICATE_RECORD, decoding back to the same KVs the
+// engine published.
+func TestServerReplicateSubscribeStreamsRecords(t *testing.T) {
+	_, db, addr := startReplicationServer(t, 64)
+	conn := dial(t, addr)
+
+	// SUBSCRIBE.
+	frame, err := wire.EncodeRequest(&wire.ReplicateSubscribeRequest{})
+	if err != nil {
+		t.Fatalf("EncodeRequest: %v", err)
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write(frame); err != nil {
+		t.Fatalf("write subscribe: %v", err)
+	}
+	// Read the ack.
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	tag, body, err := wire.ReadFrame(conn)
+	if err != nil {
+		t.Fatalf("ReadFrame ack: %v", err)
+	}
+	if wire.Status(tag) != wire.StatusOK {
+		t.Fatalf("ack: got %v want OK (body=%q)", wire.Status(tag), body)
+	}
+	if len(body) != 0 {
+		t.Fatalf("ack body: got %d bytes, want 0", len(body))
+	}
+
+	// Drive the leader. Use a small enough N that the buffer (64) is
+	// not the bottleneck; this test is about ordering and framing, not
+	// drop-on-overflow.
+	const N = 10
+	for i := 0; i < N; i++ {
+		k := []byte(fmt.Sprintf("k-%02d", i))
+		v := []byte(fmt.Sprintf("v-%02d", i))
+		if err := db.Put(k, v); err != nil {
+			t.Fatalf("Put %s: %v", k, err)
+		}
+	}
+
+	// Read N REPLICATE_RECORD frames and assert order.
+	for i := 0; i < N; i++ {
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		raw, err := wire.ReadReplicateRecord(conn)
+		if err != nil {
+			t.Fatalf("ReadReplicateRecord[%d]: %v", i, err)
+		}
+		wantKey := fmt.Sprintf("k-%02d", i)
+		wantVal := fmt.Sprintf("v-%02d", i)
+		if !bytes.Contains(raw, []byte(wantKey)) || !bytes.Contains(raw, []byte(wantVal)) {
+			t.Fatalf("record[%d]: missing key/value (want %q/%q, raw=%x)", i, wantKey, wantVal, raw)
+		}
+	}
+}
+
+// TestServerReplicateSubscribeEngineNotEnabled covers the half-config
+// case: server flag is on, engine has no replication buffer. The error
+// message must distinguish "server" vs "database" so operators can tell
+// the two misconfigurations apart.
+func TestServerReplicateSubscribeEngineNotEnabled(t *testing.T) {
+	dir := t.TempDir()
+	db, err := engine.Open(engine.Options{Dir: dir, MaxBatchEncodedSize: 16 * 1024 * 1024})
+	if err != nil {
+		t.Fatalf("engine.Open: %v", err)
+	}
+	srv := New(db, Options{
+		Addr:              "127.0.0.1:0",
+		ReadDeadline:      2 * time.Second,
+		WriteDeadline:     2 * time.Second,
+		EnableReplication: true,
+	})
+	if err := srv.Bind(); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	addr := srv.Addr().String()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve() }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		<-serveErr
+		_ = db.Close()
+	})
+
+	conn := dial(t, addr)
+	st, body := roundTrip(t, conn, &wire.ReplicateSubscribeRequest{})
+	if st != wire.StatusBadRequest {
+		t.Fatalf("status: got %v want BAD_REQUEST", st)
+	}
+	msg, err := wire.DecodeError(body)
+	if err != nil {
+		t.Fatalf("DecodeError: %v", err)
+	}
+	if msg != "replication not enabled on this database" {
+		t.Fatalf("msg: got %q", msg)
+	}
+}
+
+// TestServerReplicateSubscribeResumeTagRejected pins the v0.1.0
+// contract: non-empty resume tags are rejected loudly. If we silently
+// dropped the tag and streamed "from now", a follower expecting to
+// resume from offset N would lose every record up to the subscribe
+// point.
+func TestServerReplicateSubscribeResumeTagRejected(t *testing.T) {
+	_, _, addr := startReplicationServer(t, 64)
+	conn := dial(t, addr)
+
+	st, body := roundTrip(t, conn, &wire.ReplicateSubscribeRequest{ResumeTag: []byte("not-empty")})
+	if st != wire.StatusBadRequest {
+		t.Fatalf("status: got %v want BAD_REQUEST", st)
+	}
+	msg, err := wire.DecodeError(body)
+	if err != nil {
+		t.Fatalf("DecodeError: %v", err)
+	}
+	if msg != "resume tag not supported in v0.1.0; send empty tag" {
+		t.Fatalf("msg: got %q", msg)
+	}
+}
+
+// TestServerReplicateSubscribeSlotBusy covers the single-subscriber
+// invariant: a second concurrent subscriber gets OVERLOAD. The first
+// subscriber must already be parked in the stream loop when the second
+// dials, which we enforce by reading the first ack before issuing the
+// second subscribe.
+func TestServerReplicateSubscribeSlotBusy(t *testing.T) {
+	_, _, addr := startReplicationServer(t, 64)
+
+	// First subscriber.
+	c1 := dial(t, addr)
+	frame, _ := wire.EncodeRequest(&wire.ReplicateSubscribeRequest{})
+	if _, err := c1.Write(frame); err != nil {
+		t.Fatalf("c1 write: %v", err)
+	}
+	_ = c1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	tag, _, err := wire.ReadFrame(c1)
+	if err != nil {
+		t.Fatalf("c1 ack: %v", err)
+	}
+	if wire.Status(tag) != wire.StatusOK {
+		t.Fatalf("c1 ack: got %v want OK", wire.Status(tag))
+	}
+
+	// Second subscriber should bounce.
+	c2 := dial(t, addr)
+	st, body := roundTrip(t, c2, &wire.ReplicateSubscribeRequest{})
+	if st != wire.StatusOverload {
+		t.Fatalf("c2 status: got %v want OVERLOAD", st)
+	}
+	msg, err := wire.DecodeError(body)
+	if err != nil {
+		t.Fatalf("DecodeError: %v", err)
+	}
+	if msg != "replication slot busy; one follower at a time" {
+		t.Fatalf("c2 msg: got %q", msg)
+	}
+
+	// After the first follower disconnects, the slot frees up and a
+	// fresh subscriber can take over. This is the failover-recovery
+	// shape the design depends on (docs/replication.md §6: promote then
+	// re-subscribe).
+	//
+	// Mechanism: the server's stream loop only notices a dead follower
+	// when its next write fails, so we drive a Put through a separate
+	// writer connection to push a record at the dead conn. That write
+	// errors, the handler returns, and the deferred sub.Close()
+	// detaches.
+	_ = c1.Close()
+	writer := dial(t, addr)
+	deadline := time.Now().Add(2 * time.Second)
+	var lastSt wire.Status
+	c3 := dial(t, addr)
+	for time.Now().Before(deadline) {
+		if st, _ := roundTrip(t, writer, &wire.PutRequest{Key: []byte("k"), Value: []byte("v")}); st != wire.StatusOK {
+			t.Fatalf("writer Put: got %v want OK", st)
+		}
+		st, _ := roundTrip(t, c3, &wire.ReplicateSubscribeRequest{})
+		lastSt = st
+		if st == wire.StatusOK {
+			return
+		}
+		_ = c3.Close()
+		c3 = dial(t, addr)
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("c3 status after c1 disconnect: got %v want OK", lastSt)
 }
 
 // --- 4. Error doesn't desync the connection -----------------------------
