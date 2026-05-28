@@ -289,16 +289,50 @@ func TestServerBadFrameClassification(t *testing.T) {
 	}
 }
 
-// TestServerReplicateSubscribeDisabledByDefault verifies that even when
-// the underlying engine has replication enabled, the server requires an
-// explicit opt-in (Options.EnableReplication) before exposing the
-// subscribe endpoint. Exposing the change stream is a security-sensitive
-// capability — every write becomes externally readable — so the server
-// boundary fails closed.
+// TestServerReplicateSubscribeDisabledByDefault verifies the security
+// boundary: even when the underlying engine HAS a replication buffer
+// (so the publisher is live and records are being copied into the
+// channel), the server still rejects subscribe requests because
+// Options.EnableReplication defaults to false. Exposing the change
+// stream is a security-sensitive capability — every write becomes
+// externally readable — so the server boundary must fail closed
+// independently of engine configuration.
+//
+// The test deliberately does NOT use startServer (which opens the
+// engine without replication); a flag-off+engine-off setup would only
+// prove that the request short-circuits, not that the server boundary
+// holds when the engine is fully wired.
 func TestServerReplicateSubscribeDisabledByDefault(t *testing.T) {
-	_, addr := startServer(t, nil)
-	conn := dial(t, addr)
+	dir := t.TempDir()
+	db, err := engine.Open(engine.Options{
+		Dir:                   dir,
+		MaxBatchEncodedSize:   16 * 1024 * 1024,
+		ReplicationBufferSize: 64, // engine-side publisher live
+	})
+	if err != nil {
+		t.Fatalf("engine.Open: %v", err)
+	}
+	srv := New(db, Options{
+		Addr:          "127.0.0.1:0",
+		ReadDeadline:  2 * time.Second,
+		WriteDeadline: 2 * time.Second,
+		// EnableReplication intentionally left false — server flag off.
+	})
+	if err := srv.Bind(); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	addr := srv.Addr().String()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve() }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		<-serveErr
+		_ = db.Close()
+	})
 
+	conn := dial(t, addr)
 	st, body := roundTrip(t, conn, &wire.ReplicateSubscribeRequest{})
 	if st != wire.StatusBadRequest {
 		t.Fatalf("status: got %v want BAD_REQUEST", st)
@@ -516,23 +550,17 @@ func TestServerReplicateSubscribeSlotBusy(t *testing.T) {
 
 	// After the first follower disconnects, the slot frees up and a
 	// fresh subscriber can take over. This is the failover-recovery
-	// shape the design depends on (docs/replication.md §6: promote then
-	// re-subscribe).
-	//
-	// Mechanism: the server's stream loop only notices a dead follower
-	// when its next write fails, so we drive a Put through a separate
-	// writer connection to push a record at the dead conn. That write
-	// errors, the handler returns, and the deferred sub.Close()
-	// detaches.
+	// shape the design depends on (docs/replication.md §6: promote
+	// then re-subscribe). The server's read-watcher on c1 sees EOF
+	// once we close c1, the handler exits, and sub.Close() detaches.
+	// No leader write is required — see
+	// TestServerReplicateSubscribeIdleLeaderReleasesSlot for the
+	// explicit regression on the watcher.
 	_ = c1.Close()
-	writer := dial(t, addr)
 	deadline := time.Now().Add(2 * time.Second)
 	var lastSt wire.Status
 	c3 := dial(t, addr)
 	for time.Now().Before(deadline) {
-		if st, _ := roundTrip(t, writer, &wire.PutRequest{Key: []byte("k"), Value: []byte("v")}); st != wire.StatusOK {
-			t.Fatalf("writer Put: got %v want OK", st)
-		}
 		st, _ := roundTrip(t, c3, &wire.ReplicateSubscribeRequest{})
 		lastSt = st
 		if st == wire.StatusOK {
@@ -543,6 +571,53 @@ func TestServerReplicateSubscribeSlotBusy(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("c3 status after c1 disconnect: got %v want OK", lastSt)
+}
+
+// TestServerReplicateSubscribeIdleLeaderReleasesSlot pins the
+// read-watcher behaviour: an idle leader (no writes ever published)
+// must still release the single subscription slot when the follower
+// disconnects. Before the watcher landed, the handler only noticed a
+// dead follower on the next failed write — so a follower that crashed
+// against an idle leader would hold the slot until the next unrelated
+// write, bouncing every reconnect attempt with OVERLOAD in the
+// meantime.
+func TestServerReplicateSubscribeIdleLeaderReleasesSlot(t *testing.T) {
+	_, _, addr := startReplicationServer(t, 64)
+
+	c1 := dial(t, addr)
+	frame, _ := wire.EncodeRequest(&wire.ReplicateSubscribeRequest{})
+	if _, err := c1.Write(frame); err != nil {
+		t.Fatalf("c1 write: %v", err)
+	}
+	_ = c1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	tag, _, err := wire.ReadFrame(c1)
+	if err != nil {
+		t.Fatalf("c1 ack: %v", err)
+	}
+	if wire.Status(tag) != wire.StatusOK {
+		t.Fatalf("c1 ack: got %v want OK", wire.Status(tag))
+	}
+
+	// Hard close c1 without writing anything to the leader. The leader
+	// is fully idle — no records will ever be published on this DB.
+	_ = c1.Close()
+
+	// A reconnect should succeed within a short window (one watcher
+	// goroutine scheduling tick + ack round-trip).
+	deadline := time.Now().Add(2 * time.Second)
+	var lastSt wire.Status
+	c2 := dial(t, addr)
+	for time.Now().Before(deadline) {
+		st, _ := roundTrip(t, c2, &wire.ReplicateSubscribeRequest{})
+		lastSt = st
+		if st == wire.StatusOK {
+			return
+		}
+		_ = c2.Close()
+		c2 = dial(t, addr)
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("idle-leader slot reuse: got %v want OK", lastSt)
 }
 
 // --- 4. Error doesn't desync the connection -----------------------------

@@ -276,6 +276,24 @@ func (s *Server) untrackConn(c net.Conn) {
 	s.connsMu.Unlock()
 }
 
+// errStreamComplete is returned by streaming handlers (currently only
+// REPLICATE_SUBSCRIBE) after a successful ack to signal "the
+// connection has done its job; close it without writing anything else."
+//
+// handleConn already returns on any non-nil dispatch error, which closes
+// the conn via the deferred conn.Close in Serve. Using a distinct
+// sentinel lets us:
+//
+//   - skip logging this as a transport error (dispatch debug log gates
+//     on it);
+//   - keep the contract that followers see io.EOF on their next
+//     ReadReplicateRecord, not an in-band CLOSED frame. Returning nil
+//     from the handler would loop handleConn back to the top, where the
+//     draining check would write a CLOSED frame — which a follower
+//     reading via ReadReplicateRecord interprets as a protocol error
+//     ("expected REPLICATE_RECORD, got 0x04"), not clean end-of-stream.
+var errStreamComplete = errors.New("server: streaming handler complete; close quietly")
+
 // handleConn is the per-connection loop.
 func (s *Server) handleConn(conn net.Conn) {
 	for {
@@ -387,7 +405,7 @@ func (s *Server) dispatch(conn net.Conn, req wire.Request) error {
 		if entries > 0 {
 			attrs = append(attrs, slog.Int("entries", entries))
 		}
-		if err != nil {
+		if err != nil && !errors.Is(err, errStreamComplete) {
 			attrs = append(attrs, slog.String("transport_err", err.Error()))
 		}
 		s.log.LogAttrs(context.Background(), slog.LevelDebug, "request", attrs...)
@@ -598,12 +616,12 @@ func classifyEngineErr(err error) (wire.Status, string) {
 // handleReplicateSubscribe streams REPLICATE_RECORD frames to a follower
 // until the connection closes, the engine shuts down, or the server
 // drains. Unlike every other endpoint, this one holds the connection
-// for the lifetime of the subscription — it never returns control to
-// the per-connection request loop in a "ready for next request" state.
-// When it returns, handleConn loops back to ReadFrame; the next read
-// will see either EOF (clean follower disconnect) or hang briefly
-// before the ReadDeadline fires, after which handleConn exits and the
-// connection is closed.
+// for the lifetime of the subscription and, on completion, signals
+// handleConn to close the conn quietly (via errStreamComplete) rather
+// than loop back to ReadFrame. The reason: followers read this stream
+// with wire.ReadReplicateRecord, which interprets a CLOSED frame as a
+// protocol error, not as end-of-stream. The documented end-of-stream
+// signal is plain io.EOF on the TCP connection.
 //
 // Error mapping:
 //
@@ -670,29 +688,65 @@ func (s *Server) handleReplicateSubscribe(conn net.Conn, req *wire.ReplicateSubs
 		return wire.StatusOK, err
 	}
 
+	// Read-watcher: detect follower disconnect even when the leader is
+	// idle. The protocol says followers send zero frames after
+	// subscribe, so any Read returning (clean EOF or transport error)
+	// means the conn is gone. Without this an idle leader would hold
+	// the single subscription slot forever, bouncing every reconnect
+	// attempt with OVERLOAD until some unrelated write happened to
+	// surface the failed write through this handler.
+	//
+	// Concurrency: net.Conn permits one concurrent reader + one
+	// concurrent writer, which is exactly the shape we have (watcher
+	// reads, this goroutine writes).
+	peerGone := make(chan struct{})
+	var watcherWG sync.WaitGroup
+	watcherWG.Add(1)
+	go func() {
+		defer watcherWG.Done()
+		var buf [1]byte
+		_, _ = conn.Read(buf[:])
+		close(peerGone)
+	}()
+	defer func() {
+		// Wake the watcher so it exits before we return. Setting a
+		// past read deadline unblocks Read with a deadline error
+		// without closing the conn (handleConn's deferred close does
+		// that). The error is ignored: if conn is already torn down
+		// SetReadDeadline returns ErrClosed, which is fine.
+		_ = conn.SetReadDeadline(time.Unix(1, 0))
+		watcherWG.Wait()
+	}()
+
 	// Stream loop. The connection is now dedicated to this stream until
-	// one of three things happens:
+	// one of four things happens:
 	//
 	//   1. sub.Records() closes — DB.Close fired closeSubscriptionOnShutdown.
 	//   2. s.shutdownCh closes — server.Shutdown asked us to drain.
-	//   3. A write fails — follower disconnected or write deadline elapsed.
+	//   3. peerGone closes — the read-watcher saw EOF or any other
+	//      Read return; the follower is gone.
+	//   4. A write fails — write deadline elapsed or transport error
+	//      (e.g. the kernel surfaced the closed peer on the next send).
 	//
-	// In every case we return; handleConn observes EOF on its next read
-	// (or the conn is already torn down) and the per-connection
-	// goroutine exits.
+	// In every case we return errStreamComplete so handleConn closes
+	// the conn quietly (no in-band CLOSED frame); the follower sees
+	// io.EOF on its next ReadReplicateRecord, which is the documented
+	// end-of-stream signal.
 	for {
 		select {
 		case <-s.shutdownCh:
-			return wire.StatusOK, nil
+			return wire.StatusOK, errStreamComplete
+		case <-peerGone:
+			return wire.StatusOK, errStreamComplete
 		case rec, ok := <-sub.Records():
 			if !ok {
-				return wire.StatusOK, nil
+				return wire.StatusOK, errStreamComplete
 			}
 			if err := conn.SetWriteDeadline(time.Now().Add(s.opts.WriteDeadline)); err != nil {
-				return wire.StatusOK, err
+				return wire.StatusOK, errStreamComplete
 			}
 			if err := wire.WriteReplicateRecord(conn, rec); err != nil {
-				return wire.StatusOK, err
+				return wire.StatusOK, errStreamComplete
 			}
 		}
 	}
