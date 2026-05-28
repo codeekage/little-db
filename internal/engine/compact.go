@@ -440,19 +440,33 @@ func (db *DB) handleCompactCommit(cc *compactCommit) error {
 		newLive = append(newLive, cc.newSeg.id)
 	}
 
+	manifestUncertain := false
 	if err := writeManifest(db.opts.Dir, newLive, activeID); err != nil {
 		if errors.Is(err, ErrManifestPublishedButUncertain) {
-			// MANIFEST is already visible referencing newSeg.id and
-			// excluding the oldSegs. The submit() error path would
-			// otherwise call cleanupNewSeg() which unlinks the new
-			// merged segment — that would leave the on-disk
-			// manifest pointing at a missing file and break next
-			// Open. Log loudly and proceed with the in-memory
-			// install + old-segment teardown so the running engine
-			// matches what a fresh Open would see.
-			db.log.Warn("manifest published with uncertain durability; continuing",
+			// MANIFEST is visible referencing newSeg.id and excluding
+			// oldSegs, but the directory fsync did not confirm. After a
+			// host crash the rename may revert and the previous
+			// manifest may reappear; that manifest still references
+			// the old segments. We must therefore NOT unlink any
+			// on-disk segment (old or new) in this branch — both sets
+			// must survive the process. The next clean Open will
+			// observe whichever manifest the kernel preserved and
+			// sweep the loser as an orphan.
+			//
+			// In-memory state still moves to the post-compaction view
+			// so the running engine matches what a successful publish
+			// would have produced; this avoids reading the keydir and
+			// segments map in an inconsistent state for the remainder
+			// of this process's lifetime.
+			manifestUncertain = true
+			var newSegID uint64
+			if cc.newSeg != nil {
+				newSegID = uint64(cc.newSeg.id)
+			}
+			db.log.Warn("manifest published with uncertain durability; preserving old segments on disk",
 				slog.String("op", "compact_commit"),
-				slog.Uint64("new_seg_id", uint64(cc.newSeg.id)),
+				slog.Uint64("new_seg_id", newSegID),
+				slog.Int("old_seg_count", len(cc.oldSegs)),
 				slog.String("err", err.Error()))
 		} else {
 			return fmt.Errorf("compact: persist manifest: %w", err)
@@ -483,8 +497,17 @@ func (db *DB) handleCompactCommit(cc *compactCommit) error {
 	// from db.segments now, so no reader can hold a fresh pointer to
 	// them; any reader that picked up a pointer before our Lock has
 	// already finished its pread (Lock waited for the RLock to drain).
+	//
+	// In the manifestUncertain branch we MUST NOT unlink: the previous
+	// manifest may resurface after a crash and still reference these
+	// segments. Close the fds (the running process is committed to the
+	// new view and won't reopen them), but leave the bytes on disk for
+	// the next clean Open's sweepOrphans() to disposition.
 	for _, s := range cc.oldSegs {
 		_ = s.close()
+		if manifestUncertain {
+			continue
+		}
 		_ = os.Remove(s.path)
 		_ = removeHintFile(db.opts.Dir, s.id)
 	}
