@@ -14,12 +14,12 @@
 
 ## 0. Constraints that shaped everything
 
-| Constraint                                              | Consequence                                                                                                                |
-| ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| Go 1.22 stdlib only — no third-party deps               | No RocksDB, no embedded SQLite, no gRPC. Wire protocol, storage engine, and concurrency primitives are first-party.        |
-| Single-binary deployment                                | No background sidecars, no IPC, no shared-memory tricks.                                                                   |
-| Take-home time budget                                   | "Do one thing very well, document the rest." Bias: depth over breadth, and explicit non-goals over hand-waving.            |
-| Boring-correct over clever                              | Prefer well-understood designs (Bitcask, single-writer, F_FULLFSYNC) and defend every scope cut in writing instead of inventing new primitives. |
+| Constraint                                | Consequence                                                                                                                                     |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Go 1.22 stdlib only — no third-party deps | No RocksDB, no embedded SQLite, no gRPC. Wire protocol, storage engine, and concurrency primitives are first-party.                             |
+| Single-binary deployment                  | No background sidecars, no IPC, no shared-memory tricks.                                                                                        |
+| Take-home time budget                     | "Do one thing very well, document the rest." Bias: depth over breadth, and explicit non-goals over hand-waving.                                 |
+| Boring-correct over clever                | Prefer well-understood designs (Bitcask, single-writer, F_FULLFSYNC) and defend every scope cut in writing instead of inventing new primitives. |
 
 These constraints are why the project does not use an LSM tree, a custom
 network protocol-buffer dialect, or a goroutine-per-write model that
@@ -32,13 +32,13 @@ ultimately reduces to one of these four lines.
 
 ### 1.1 Alternatives considered
 
-| Option                          | Read latency | Write throughput | Recovery cost                | Implementation cost | Fit for take-home |
-| ------------------------------- | ------------ | ---------------- | ---------------------------- | ------------------- | ----------------- |
-| **Bitcask** (log + keydir)      | O(1) (1 seek) | very high (append) | O(live keys / hint bytes) once the hint sidecar verifies | low                 | ✅                |
-| LSM tree (LevelDB-style)        | O(log N)     | very high        | O(WAL replay)                | high (compaction policy, bloom filters, level scheduling) | ❌ — months of work to get right |
-| B+tree                          | O(log N)     | moderate (in-place updates) | O(1) if WAL'd                 | high (page management, split/merge)                       | ❌                |
-| In-memory map + WAL (no segs)   | O(1)         | high             | O(WAL) — full replay         | trivial             | ❌ — does not satisfy "data outlives process" at scale; recovery time unbounded |
-| Sorted array + binary search    | O(log N)     | terrible (rewrite) | O(file)                       | trivial             | ❌                |
+| Option                        | Read latency  | Write throughput            | Recovery cost                                            | Implementation cost                                       | Fit for take-home                                                               |
+| ----------------------------- | ------------- | --------------------------- | -------------------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| **Bitcask** (log + keydir)    | O(1) (1 seek) | very high (append)          | O(live keys / hint bytes) once the hint sidecar verifies | low                                                       | ✅                                                                              |
+| LSM tree (LevelDB-style)      | O(log N)      | very high                   | O(WAL replay)                                            | high (compaction policy, bloom filters, level scheduling) | ❌ — months of work to get right                                                |
+| B+tree                        | O(log N)      | moderate (in-place updates) | O(1) if WAL'd                                            | high (page management, split/merge)                       | ❌                                                                              |
+| In-memory map + WAL (no segs) | O(1)          | high                        | O(WAL) — full replay                                     | trivial                                                   | ❌ — does not satisfy "data outlives process" at scale; recovery time unbounded |
+| Sorted array + binary search  | O(log N)      | terrible (rewrite)          | O(file)                                                  | trivial                                                   | ❌                                                                              |
 
 ### 1.2 Why Bitcask wins for this scope
 
@@ -88,19 +88,19 @@ requests are funnelled through a buffered channel to the writer.
 
 ### 2.2 Alternatives considered
 
-| Option                                | Throughput | Correctness story         | Implementation cost           |
-| ------------------------------------- | ---------- | ------------------------- | ----------------------------- |
-| **Single writer + buffered channel**  | high (group commit) | trivial — no append-side race | low                   |
-| Goroutine-per-connection with mutex   | low        | mutex contention dominates | low                          |
-| Sharded writers (one per key range)   | very high  | complicates compaction + manifest atomicity | high           |
-| Optimistic / lock-free append         | very high  | requires CAS-based segment offset reservation + torn-write handling | very high |
+| Option                               | Throughput          | Correctness story                                                   | Implementation cost |
+| ------------------------------------ | ------------------- | ------------------------------------------------------------------- | ------------------- |
+| **Single writer + buffered channel** | high (group commit) | trivial — no append-side race                                       | low                 |
+| Goroutine-per-connection with mutex  | low                 | mutex contention dominates                                          | low                 |
+| Sharded writers (one per key range)  | very high           | complicates compaction + manifest atomicity                         | high                |
+| Optimistic / lock-free append        | very high           | requires CAS-based segment offset reservation + torn-write handling | very high           |
 
 ### 2.3 Why single-writer wins
 
 - **Group commit is free.** The writer naturally accumulates a burst from
   the channel buffer, encodes it into one `write(2)` + one `fsync`, and
   replies to every requester. With `SyncOnPut=true`, p99 latency under
-  load is dominated by *one* fsync per burst, not one per request.
+  load is dominated by _one_ fsync per burst, not one per request.
 - **No append-side race.** The active segment's offset is mutated by
   exactly one goroutine. There is no "key A and key B both think they got
   offset 1024" pathology to defend.
@@ -123,7 +123,7 @@ requests are funnelled through a buffered channel to the writer.
 
 ---
 
-## 3. Durability: F_FULLFSYNC by default
+## 3. Durability: F_FULLFSYNC when sync durability is requested
 
 ### 3.1 The claim
 
@@ -198,8 +198,10 @@ restart. Riak Bitcask documents the same fix.
 Hint files trade one inexpensive write (the hint sidecar) at compaction
 time for a 10–100× faster cold start. The trade is well-documented in
 SPEC §9 (data CRC is not re-checked when the hint fast-path is taken;
-mid-segment corruption inside a hinted segment is only surfaced on a
-later Get). Strengthening hints with a per-entry value digest is listed
+mid-segment corruption inside a hinted segment may become observable
+when a later `Get` returns corrupted bytes — the engine does not
+currently reverify the record CRC on `Get`). Strengthening hints with a
+per-entry value digest is listed
 as future work.
 
 ### 4.4 Atomic manifest swap
@@ -225,12 +227,12 @@ metadata, no extensions. Documented in SPEC §10.
 
 ### 5.2 Alternatives considered
 
-| Option                                          | Why we rejected it                                                                                                                |
-| ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| HTTP/JSON (REST)                                | Per-request HTTP overhead is ~30 % of total work for small values. JSON encode/decode is the bottleneck under load. Easy to reach for, wrong for a key-value engine. |
-| gRPC                                            | Forbidden by the stdlib-only constraint. Also: protobuf-generated code is large, and the schema is overkill for 4 ops.            |
-| Redis RESP                                      | Tempting (RESP3 is compact and well-understood), but pulling in client compatibility means committing to a much larger API surface (~200 commands). Out of scope.    |
-| Custom text protocol (memcached-style)          | Easier to debug by hand, but parsing is slower and the size-prefix discipline matters more than human-readability for a binary KV. |
+| Option                                 | Why we rejected it                                                                                                                                                   |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| HTTP/JSON (REST)                       | Per-request HTTP overhead is ~30 % of total work for small values. JSON encode/decode is the bottleneck under load. Easy to reach for, wrong for a key-value engine. |
+| gRPC                                   | Forbidden by the stdlib-only constraint. Also: protobuf-generated code is large, and the schema is overkill for 4 ops.                                               |
+| Redis RESP                             | Tempting (RESP3 is compact and well-understood), but pulling in client compatibility means committing to a much larger API surface (~200 commands). Out of scope.    |
+| Custom text protocol (memcached-style) | Easier to debug by hand, but parsing is slower and the size-prefix discipline matters more than human-readability for a binary KV.                                   |
 
 ### 5.3 Why length-prefixed binary
 
@@ -243,7 +245,7 @@ metadata, no extensions. Documented in SPEC §10.
   opcodes never change shape. This is a soft contract with future readers.
 - **Explicit size cap (`MaxFramePayload` = 32 MiB).** Pathological clients
   cannot OOM the server with one frame, and the BATCH encoder (post-v0.1.0
-  round 1 fix) checks the running size *before* allocating.
+  round 1 fix) checks the running size _before_ allocating.
 
 ### 5.4 What the protocol does NOT do
 
@@ -328,16 +330,16 @@ branch. The relevant decisions for the design-rationale audience:
 
 ## 8. What we explicitly did not build (and why)
 
-| Feature                          | Why not                                                                                                                       |
-| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| Multi-tenancy / namespaces       | One engine per tenant is a sharper boundary than in-engine namespaces. Out of scope; the operator's problem.                  |
-| Sharding                         | Out of scope for a single-binary engine. The scale-out story is application-layer sharding (consistent hash, per-tenant DB).  |
-| Encryption at rest               | The OS already offers this (LUKS, FileVault, BitLocker). Re-implementing it inside the engine is a security risk, not a feature. |
+| Feature                          | Why not                                                                                                                                           |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Multi-tenancy / namespaces       | One engine per tenant is a sharper boundary than in-engine namespaces. Out of scope; the operator's problem.                                      |
+| Sharding                         | Out of scope for a single-binary engine. The scale-out story is application-layer sharding (consistent hash, per-tenant DB).                      |
+| Encryption at rest               | The OS already offers this (LUKS, FileVault, BitLocker). Re-implementing it inside the engine is a security risk, not a feature.                  |
 | Backup tooling                   | `cp -a` over a paused engine is the documented procedure (`docs/ops.md`). A hot backup would require a snapshot opcode; that is a future project. |
-| Snapshot bootstrap for followers | Listed in replication.md as the next phase. Requires a parallel transfer protocol; we ship the documented manual workaround instead. |
-| Range scans                      | Bitcask keydir is a hash, not a sorted structure. A secondary index is the right fix if needed; out of scope.                 |
-| TTL / expiration                 | Adds compaction complexity (timer-driven liveness in addition to overwrite-driven). Application-layer expiration is sufficient. |
-| Multi-version / MVCC             | Out of scope. The engine has no transactions beyond BATCH atomicity (per SPEC §4).                                            |
+| Snapshot bootstrap for followers | Listed in replication.md as the next phase. Requires a parallel transfer protocol; we ship the documented manual workaround instead.              |
+| Range scans                      | Bitcask keydir is a hash, not a sorted structure. A secondary index is the right fix if needed; out of scope.                                     |
+| TTL / expiration                 | Adds compaction complexity (timer-driven liveness in addition to overwrite-driven). Application-layer expiration is sufficient.                   |
+| Multi-version / MVCC             | Out of scope. The engine has no transactions beyond BATCH atomicity (per SPEC §4).                                                                |
 
 Every row is a deliberate cut. None is a defect.
 
