@@ -114,6 +114,8 @@ func TestRequestRoundTrip(t *testing.T) {
 		&ReadKeyRangeRequest{Start: []byte("k"), End: []byte("k")}, // equal
 		&PingRequest{},
 		&StatsRequest{},
+		&ReplicateSubscribeRequest{},                            // empty resume-tag ("stream from now")
+		&ReplicateSubscribeRequest{ResumeTag: []byte("cursor")}, // opaque cursor
 	}
 	for _, req := range cases {
 		t.Run(req.Op().String(), func(t *testing.T) {
@@ -172,6 +174,9 @@ func requestsEqual(a, b Request) bool {
 	case *StatsRequest:
 		_, ok := b.(*StatsRequest)
 		return ok
+	case *ReplicateSubscribeRequest:
+		br, ok := b.(*ReplicateSubscribeRequest)
+		return ok && bytes.Equal(ar.ResumeTag, br.ResumeTag)
 	}
 	return false
 }

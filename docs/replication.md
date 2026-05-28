@@ -135,15 +135,17 @@ following extends.
 ### 4.1 `REPLICATE_SUBSCRIBE` (follower → leader)
 
 ```
-+--------+--------------------+
-| op (1) | opaque resume-tag  |   resume-tag length carried by frame size
-+--------+--------------------+
++--------+-----------------+-------------------+
+| op (1) | u32 tag_len     | resume_tag (N)    |
++--------+-----------------+-------------------+
 ```
 
 The resume-tag is currently always empty (the follower starts streaming
-from "now"). The field is present in the wire so a future snapshot-bootstrap
+from "now", so `tag_len = 0` and the `resume_tag` field is zero bytes).
+The field is present in the wire so a future snapshot-bootstrap
 implementation does not require a wire protocol revision: the tag would
-carry an opaque cursor that the leader can interpret.
+carry an opaque cursor that the leader can interpret. `tag_len` is
+bounded by `wire.MaxResumeTagLen` (64 KiB).
 
 **Server response**: a stream of `REPLICATE_RECORD` frames until the
 connection closes. There is no terminating frame; subscription is

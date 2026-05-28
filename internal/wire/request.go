@@ -332,6 +332,8 @@ func encodeRequestBody(req Request) ([]byte, error) {
 		return nil, nil
 	case *StatsRequest:
 		return nil, nil
+	case *ReplicateSubscribeRequest:
+		return EncodeReplicateSubscribe(r.ResumeTag)
 	default:
 		return nil, asProtocolErr("unknown request type %T", req)
 	}

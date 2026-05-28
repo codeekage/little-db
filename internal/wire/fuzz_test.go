@@ -24,6 +24,8 @@ func FuzzDecodeRequest(f *testing.F) {
 		&ReadKeyRangeRequest{Start: []byte("a"), End: []byte("z")},
 		&PingRequest{},
 		&StatsRequest{},
+		&ReplicateSubscribeRequest{},
+		&ReplicateSubscribeRequest{ResumeTag: []byte("cursor")},
 	}
 	for _, s := range seeds {
 		body, err := encodeRequestBody(s)

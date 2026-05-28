@@ -45,9 +45,20 @@ const (
 
 	// MaxReplicationRecord caps the inner record bytes in a single
 	// REPLICATE_RECORD frame. One opcode byte already consumes the frame
-	// tag, so the record body must fit in MaxFramePayload - 1. A
-	// max-sized bitcask record (64 KiB key + 16 MiB value + ~28 B
-	// header) is ~16.06 MiB, comfortably under this ceiling.
+	// tag, so the record body must fit in MaxFramePayload - 1.
+	//
+	// Cross-package contract: the engine's default MaxBatchEncodedSize
+	// (64 MiB) is intentionally larger than this cap, since the codec is
+	// also used by single-node deployments without replication. When
+	// replication is enabled the leader MUST be opened with
+	// MaxBatchEncodedSize <= MaxReplicationRecord, otherwise an oversize
+	// batch would be appended to the local segment successfully but the
+	// publisher would have no legal frame to wrap it in. Enforcement
+	// lives in the engine bring-up path (see the leader-mode option
+	// validation); chunked replication records were considered and
+	// rejected as out of scope for v0.1.0. A single-PUT max record
+	// (~16.06 MiB: 64 KiB key + 16 MiB value + ~28 B header) fits with
+	// comfortable slack.
 	MaxReplicationRecord = MaxFramePayload - 1
 )
 
