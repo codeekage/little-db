@@ -146,9 +146,10 @@ jq -r 'to_entries[]
   | ./bin/little-db batch -
 ```
 
-Per-call limits: ≤ **65 536 entries**, ≤ **64 MiB** encoded body
-(see `--max-batch-encoded-size` on `serve`). For larger imports,
-chunk the file (`split -l 5000 …`) and submit one batch per chunk.
+Per-call limits: ≤ **65 536 entries**, ≤ **32 MiB** encoded body
+(wire-frame cap; server-side engine cap is `--max-batch-encoded-size`,
+default 64 MiB). For larger imports, chunk the file (`split -l 5000 …`)
+and submit one batch per chunk.
 
 A batch is **atomic**: either every entry lands or none do. See
 [docs/SPEC.md §4.4](docs/SPEC.md) for the on-disk record format.

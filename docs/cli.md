@@ -115,7 +115,7 @@ All limits are wire-protocol-level and enforced both client-side
 | Max key length          | **64 KiB**                                       |
 | Max value length        | **16 MiB**                                       |
 | Max entries per `batch` | **65 536**                                       |
-| Max encoded batch body  | **64 MiB**                                       |
+| Max encoded batch body  | **32 MiB** (`wire.MaxFramePayload - 1`)          |
 | Max range payload bytes | **64 MiB** (server `--max-range-response-bytes`) |
 
 `batch` validates the encoded body size _as it parses_ each line and
@@ -429,8 +429,8 @@ The CLI streams the file and rejects locally (exit `2`) on:
 - `op` not in `{"put", "delete"}`.
 - Empty key or key over the 64 KiB cap.
 - Value over the 16 MiB cap.
-- Cumulative encoded body over 64 MiB (cap is `wire.MaxFramePayload - 1`).
-- More than 10 000 entries.
+- Cumulative encoded body over 32 MiB (cap is `wire.MaxFramePayload - 1`).
+- More than 65 536 entries.
 - Zero entries.
 
 ### Output
@@ -526,7 +526,7 @@ jq -r 'to_entries[]
   | little-db batch -
 ```
 
-### Chunked import for files larger than 10 000 records or 64 MiB
+### Chunked import for files larger than 65 536 records or 32 MiB
 
 ```bash
 split -l 5000 huge.ndjson chunk_
