@@ -352,7 +352,15 @@ func encodeBatch(r *BatchRequest) ([]byte, error) {
 	if len(r.Entries) > MaxBatchEntries {
 		return nil, asProtocolErr("BATCH: count=%d exceeds max=%d", len(r.Entries), MaxBatchEntries)
 	}
-	size := 4 // count
+	// Track the encoded body size in uint64 and enforce the frame cap
+	// inside the validation loop, BEFORE the allocation below. Without
+	// this check a client that sends many MaxValLen entries can force a
+	// multi-GiB allocation here even though EncodeFrame would later
+	// reject the frame: the allocation has already happened. The body
+	// must fit alongside a 1-byte opcode in MaxFramePayload, hence the
+	// `MaxFramePayload - 1` ceiling.
+	const maxBody = uint64(MaxFramePayload) - 1
+	size := uint64(4) // u32 count
 	for i, e := range r.Entries {
 		if err := checkKey(e.Key, "BATCH"); err != nil {
 			return nil, asProtocolErr("BATCH entry %d: %s", i, err.Error())
@@ -363,7 +371,14 @@ func encodeBatch(r *BatchRequest) ([]byte, error) {
 		if !e.Delete && len(e.Value) > MaxValLen {
 			return nil, asProtocolErr("BATCH entry %d: val_len=%d exceeds max=%d", i, len(e.Value), MaxValLen)
 		}
-		size += 1 + 4 + len(e.Key) + 4 + len(e.Value)
+		// u8 op + u32 klen + key + u32 vlen + val
+		entrySize := uint64(1) + 4 + uint64(len(e.Key)) + 4 + uint64(len(e.Value))
+		if size+entrySize > maxBody {
+			return nil, asProtocolErr(
+				"BATCH: encoded body would exceed wire max (running=%d, entry=%d adds to %d, max=%d)",
+				size, i, size+entrySize, maxBody)
+		}
+		size += entrySize
 	}
 	buf := make([]byte, size)
 	binary.BigEndian.PutUint32(buf[0:4], uint32(len(r.Entries)))

@@ -272,6 +272,34 @@ func TestDecodeRequestRejectsInvalid(t *testing.T) {
 	}
 }
 
+// TestEncodeBatchRejectsOversizeBeforeAlloc guards against a client
+// being able to force a multi-GiB allocation in encodeBatch by passing
+// many max-size entries. The body cap must be enforced inside the
+// validation loop, before make([]byte, size). A failing version of this
+// test would either OOM (best case) or quietly allocate hundreds of MB
+// (worst case, masked on machines with lots of RAM).
+func TestEncodeBatchRejectsOversizeBeforeAlloc(t *testing.T) {
+	// Construct entries whose combined encoded body would exceed
+	// MaxFramePayload but whose count is still under MaxBatchEntries.
+	// 4 entries × (1 + 4 + 1 + 4 + MaxValLen) ≈ 64 MiB > 32 MiB cap.
+	bigVal := bytes.Repeat([]byte{'x'}, MaxValLen)
+	entries := make([]BatchEntry, 4)
+	for i := range entries {
+		entries[i] = BatchEntry{Key: []byte("k"), Value: bigVal}
+	}
+	_, err := EncodeRequest(&BatchRequest{Entries: entries})
+	if err == nil {
+		t.Fatal("expected EncodeRequest to reject oversize batch, got nil")
+	}
+	var pe *ProtocolError
+	if !errors.As(err, &pe) {
+		t.Fatalf("expected *ProtocolError, got %T %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "exceed") {
+		t.Fatalf("expected error to mention exceeding the cap, got: %v", err)
+	}
+}
+
 // --- Response: GET / STATS / Error --------------------------------------
 
 func TestGetOKRoundTrip(t *testing.T) {
