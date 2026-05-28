@@ -19,12 +19,12 @@
 | Go 1.22 stdlib only — no third-party deps               | No RocksDB, no embedded SQLite, no gRPC. Wire protocol, storage engine, and concurrency primitives are first-party.        |
 | Single-binary deployment                                | No background sidecars, no IPC, no shared-memory tricks.                                                                   |
 | Take-home time budget                                   | "Do one thing very well, document the rest." Bias: depth over breadth, and explicit non-goals over hand-waving.            |
-| Must demonstrate senior-IC engineering, not novelty     | Pick the most boring correct design, then defend why each cut is safe.                                                     |
+| Boring-correct over clever                              | Prefer well-understood designs (Bitcask, single-writer, F_FULLFSYNC) and defend every scope cut in writing instead of inventing new primitives. |
 
 These constraints are why the project does not use an LSM tree, a custom
-network protocol-buffer dialect, or a goroutine-per-connection model with
-shared state. Every "why didn't you do X" answer below ultimately reduces
-to one of these four lines.
+network protocol-buffer dialect, or a goroutine-per-write model that
+mutates shared storage state. Every "why didn't you do X" answer below
+ultimately reduces to one of these four lines.
 
 ---
 
@@ -47,9 +47,10 @@ to one of these four lines.
    "the index is ahead of the data" or "the data is ahead of the index"
    race that LSM trees and B+trees both have to engineer around.
 2. **Recovery is bounded and observable.** With hint files (`§5` of SPEC),
-   a clean restart is O(seg_count) deserializations, not O(record_count)
-   scans. The cold-restart path is the one we have to defend in a
-   take-home — Bitcask makes it short and provable.
+   a clean restart is O(live keys / hint bytes) deserialisation —
+   roughly the size of the keydir we need to rebuild — not O(record_count)
+   scans of every segment. The cold-restart path is the one we have to
+   defend in a take-home; Bitcask makes it short and provable.
 3. **Append-only writes match the durability primitive we have.**
    `F_FULLFSYNC` on darwin is per-fd; an append + fsync of a single open
    file is the cleanest possible durability story. LSM compaction
@@ -148,12 +149,15 @@ catastrophic.
 
 ### 3.4 The portable fallback
 
-On Linux, `os.File.Sync()` (which translates to `fdatasync(2)` under
-the hood for our use case) is the strongest portable primitive. Linux's
-default journaling FS (`ext4` with `data=ordered`) honours it. The build
-tag `unix && !darwin` selects the portable path; we did not pursue
-Linux-specific `sync_file_range` or `io_uring` because the stdlib does
-not expose them and the project bans third-party deps.
+On Linux and the BSDs, `fullSync` defers to `os.File.Sync()`, which in
+Go's stdlib calls `syscall.Fsync` — plain `fsync(2)`. On commodity
+filesystems (`ext4`, `xfs`) with default mount options, `fsync(2)` does
+flush the drive write cache when the hardware honours its barrier, so
+this is the strongest portable primitive we can reach from the stdlib.
+The build tag `linux || freebsd || netbsd || openbsd` selects this
+path; we did not pursue Linux-specific `sync_file_range` or `io_uring`
+because the stdlib does not expose them and the project bans third-party
+deps.
 
 ### 3.5 Group commit semantics
 
@@ -235,15 +239,19 @@ metadata, no extensions. Documented in SPEC §10.
   call. No reflection, no allocations beyond the payload buffer.
 - **Frozen at v0.1.0.** Adding a field is a new opcode; the existing
   opcodes never change shape. This is a soft contract with future readers.
-- **Explicit size cap (`MaxFramePayload` = 64 MiB).** Pathological clients
+- **Explicit size cap (`MaxFramePayload` = 32 MiB).** Pathological clients
   cannot OOM the server with one frame, and the BATCH encoder (post-v0.1.0
   round 1 fix) checks the running size *before* allocating.
 
 ### 5.4 What the protocol does NOT do
 
-- No streaming. A request is one frame, a reply is one frame. Replication
-  on the bonus branch adds `REPLICATE_RECORD` as a server-pushed stream;
-  that is the only multi-frame opcode.
+- **Mostly request-reply.** The base ops (`GET`, `PUT`, `DELETE`, `BATCH`)
+  are exactly one request frame and one reply frame. `READKEYRANGE` is the
+  one v0.1.0 exception: the server pushes a stream of range-page frames
+  followed by an end-or-error terminator (see `internal/wire/response.go`'s
+  `EncodeRangePage` / `EncodeRangeEnd` and SPEC §10). Replication on the
+  bonus branch adds a second streaming path (`REPLICATE_RECORD` after a
+  one-shot `REPLICATE_SUBSCRIBE`).
 - No authentication. Trusted-network deployment. Documented in SPEC §10.
 - No compression. Values are stored and transmitted as-is. A future
   compression opcode would be a separate frame format, not a flag on the
@@ -303,10 +311,15 @@ branch. The relevant decisions for the design-rationale audience:
 - **Followers are read-capable but explicitly stale.** Clients that need
   fresh reads must talk to the leader. This is the same contract
   Postgres async streaming offers; not a defect.
-- **Manual failover is fenced via the wire protocol.** A `promote` CLI
-  flips a follower to leader; the old leader, if reachable, rejects
-  writes with `FOLLOWER_READ_ONLY` (the freed status code from the v0.1.0
-  reservation). Production deployment would add a STONITH step.
+- **Manual failover is operator-driven; the wire protocol carries the
+  signal but does not perform the fence.** A `promote` CLI flips a
+  follower to leader; the new leader rejects writes intended for the old
+  leader’s clients with `FOLLOWER_READ_ONLY` (the freed status code from
+  the v0.1.0 reservation). Fencing the old leader — ensuring it cannot
+  keep accepting writes after promotion — is the operator’s job (kill
+  the process, revoke network access, STONITH). The replication design
+  doc is explicit that doing this in software without consensus is the
+  classic source of split-brain.
 
 ---
 
