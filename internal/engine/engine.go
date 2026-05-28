@@ -193,18 +193,25 @@ const (
 	writeKindDelete
 	writeKindBatch
 	writeKindCompactCommit
+	// writeKindApply is a follower-side replication apply. The raw
+	// bytes are a complete bitcask record exactly as the leader wrote
+	// it (header + body, including the leader's CRC). The follower
+	// appends them verbatim so the on-disk content is byte-identical
+	// across leader and follower.
+	writeKindApply
 )
 
 // writeRequest is one in-flight mutating operation sent from a caller
 // goroutine to the writer goroutine. The reply channel has capacity 1 so the
 // writer never blocks publishing a result. For Put/Delete, key/value carry
 // the operands. For Batch, entries carries the whole batch and key/value are
-// unused.
+// unused. For Apply, raw carries the verbatim leader-encoded record.
 type writeRequest struct {
 	kind    writeKind
 	key     []byte
 	value   []byte
 	entries []BatchEntry
+	raw     []byte         // non-nil only for writeKindApply
 	compact *compactCommit // non-nil only for writeKindCompactCommit
 	reply   chan error
 }
@@ -1123,6 +1130,9 @@ func (db *DB) handleOne(req *writeRequest) (bool, error) {
 		// Compact commit has its own durability barrier (writeManifest);
 		// it does not touch the active segment, so appendedActive=false.
 		return false, db.handleCompactCommit(req.compact)
+	}
+	if req.kind == writeKindApply {
+		return db.handleReplicateApply(req)
 	}
 	rec := record{
 		key: req.key,
