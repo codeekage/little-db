@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -498,4 +500,149 @@ func TestApplyReplicatedRecordMalformedBatchNotPersisted(t *testing.T) {
 		t.Fatalf("reopen after rejected malformed batch: %v", err)
 	}
 	_ = reopened.Close()
+}
+
+// TestApplyReplicatedRecordRejectedRecordDoesNotAdvanceClock pins the
+// "rejected => fully rolled back" contract for lastTstamp. A malformed
+// record that is rejected at the pre-validation stage must not bump
+// the writer's monotonic clock — otherwise a stream of bad records
+// could silently push every subsequent locally generated timestamp
+// far into the future.
+func TestApplyReplicatedRecordRejectedRecordDoesNotAdvanceClock(t *testing.T) {
+	follower := openFollower(t)
+	farFuture := time.Now().Add(100 * 365 * 24 * time.Hour).UnixNano()
+	before := follower.lastTstamp
+
+	// Build a BATCH whose outer CRC is valid but whose body is
+	// malformed (count=2, one entry) AND whose timestamp is far in
+	// the future. If the ratchet still happens before validation,
+	// lastTstamp will jump to farFuture even though the record is
+	// rejected.
+	body := make([]byte, 0)
+	count := make([]byte, 4)
+	binary.LittleEndian.PutUint32(count, 2)
+	body = append(body, count...)
+	entry := make([]byte, batchEntryHeaderSize+2)
+	entry[0] = recordFlagPut
+	binary.LittleEndian.PutUint32(entry[1:5], 1)
+	binary.LittleEndian.PutUint32(entry[5:9], 1)
+	entry[9] = 'a'
+	entry[10] = '1'
+	body = append(body, entry...)
+
+	raw := make([]byte, recordHeaderSize+len(body))
+	binary.LittleEndian.PutUint64(raw[4:12], uint64(farFuture))
+	raw[12] = recordFlagBatch
+	binary.LittleEndian.PutUint32(raw[13:17], 0)
+	binary.LittleEndian.PutUint32(raw[17:21], uint32(len(body)))
+	copy(raw[recordHeaderSize:], body)
+	sum := crc32.Checksum(raw[4:], crc32cTable)
+	binary.LittleEndian.PutUint32(raw[0:4], sum)
+
+	if err := follower.ApplyReplicatedRecord(raw); !errors.Is(err, ErrReplicationMalformed) {
+		t.Fatalf("apply: got %v want ErrReplicationMalformed", err)
+	}
+	if got := follower.lastTstamp; got >= farFuture {
+		t.Fatalf("lastTstamp advanced on rejected record: before=%d after=%d farFuture=%d", before, got, farFuture)
+	}
+	// And a subsequent local Put still mints a sane timestamp
+	// (near now, not near farFuture).
+	if err := follower.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("post-reject Put: %v", err)
+	}
+	if got := follower.lastTstamp; got >= farFuture {
+		t.Fatalf("post-Put lastTstamp polluted by rejected record: got=%d farFuture=%d", got, farFuture)
+	}
+}
+
+// TestApplyReplicatedRecordBatchAtomicVsConcurrentRange exercises the
+// applyBatchIfNewer lock-coverage promise: a concurrent ReadKeyRange
+// snapshot must observe either none or all of a replicated BATCH's
+// keydir updates, never a prefix. A previous implementation walked
+// entries with one putIfNewer per key under separate locks, which
+// would let a snapshot see a partial batch.
+func TestApplyReplicatedRecordBatchAtomicVsConcurrentRange(t *testing.T) {
+	// Capture one big batch from a leader: 64 keys "bk00".."bk63",
+	// every value the literal "v". The reader scans the [bk, bl)
+	// range and must always see either 0 or 64 entries.
+	const n = 64
+	leader, err := Open(Options{Dir: t.TempDir(), MaxBatchEncodedSize: 16 * 1024 * 1024, ReplicationBufferSize: 16})
+	if err != nil {
+		t.Fatalf("leader Open: %v", err)
+	}
+	defer leader.Close()
+	sub, err := leader.Subscribe()
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub.Close()
+
+	entries := make([]BatchEntry, n)
+	for i := range entries {
+		entries[i] = BatchEntry{
+			Key:   []byte(fmt.Sprintf("bk%02d", i)),
+			Value: []byte("v"),
+		}
+	}
+	if err := leader.BatchPut(entries); err != nil {
+		t.Fatalf("BatchPut: %v", err)
+	}
+	batchRaw := waitRecord(t, sub)
+
+	follower := openFollower(t)
+
+	// Reader goroutines hammer ReadKeyRange while the writer
+	// applies the batch a small delay later. Each observation
+	// records the number of keys in the range; a non-zero,
+	// non-n observation is a prefix and a test failure.
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	bad := make(chan int, 16)
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for !stop.Load() {
+				count := 0
+				err := follower.ReadKeyRange([]byte("bk"), []byte("bl"), func(_, _ []byte) bool {
+					count++
+					return true
+				})
+				if err != nil {
+					return
+				}
+				if count != 0 && count != n {
+					select {
+					case bad <- count:
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+
+	// Give readers a moment to spin up.
+	time.Sleep(20 * time.Millisecond)
+	if err := follower.ApplyReplicatedRecord(batchRaw); err != nil {
+		t.Fatalf("apply batch: %v", err)
+	}
+	// Let readers see the post-apply state.
+	time.Sleep(20 * time.Millisecond)
+	stop.Store(true)
+	wg.Wait()
+	close(bad)
+
+	for got := range bad {
+		t.Fatalf("ReadKeyRange observed prefix of batch: %d keys (want 0 or %d)", got, n)
+	}
+	// Sanity: the batch did actually land.
+	finalCount := 0
+	_ = follower.ReadKeyRange([]byte("bk"), []byte("bl"), func(_, _ []byte) bool {
+		finalCount++
+		return true
+	})
+	if finalCount != n {
+		t.Fatalf("post-apply range count: got %d want %d", finalCount, n)
+	}
 }

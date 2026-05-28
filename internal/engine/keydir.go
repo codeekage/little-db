@@ -132,6 +132,48 @@ func (k *keydir) applyBatch(ops []keydirOp) {
 	k.mu.Unlock()
 }
 
+// applyBatchIfNewer is the timestamp-gated cousin of applyBatch used by the
+// follower replication apply path. Every op is evaluated under a single write
+// lock with putIfNewer semantics: a put lands only if no existing entry has a
+// strictly greater tstamp, and a delete fires only when the existing entry's
+// tstamp is <= the op's tstamp (with the absent case treated as "delete is a
+// no-op" — there is nothing to remove).
+//
+// For delete ops the caller stores the gating tstamp in op.entry.tstamp; the
+// rest of op.entry is ignored on the delete branch.
+//
+// Why this exists: the follower needs both properties at once —
+//
+//  1. Stale-record rollback protection (a re-delivered older record must
+//     not overwrite a newer one in the in-memory keydir, mirroring
+//     recovery's putIfNewer behaviour); and
+//  2. Whole-batch atomic visibility to snapshot readers (a concurrent
+//     ReadKeyRange must observe either none or all of the batch's keydir
+//     updates, never a prefix).
+//
+// The plain applyBatch gives #2 but not #1; calling putIfNewer per entry
+// outside any shared lock gives #1 but not #2. This helper gives both.
+func (k *keydir) applyBatchIfNewer(ops []keydirOp) {
+	if len(ops) == 0 {
+		return
+	}
+	k.mu.Lock()
+	for i := range ops {
+		op := &ops[i]
+		sk := string(op.key)
+		if op.delete {
+			if existing, ok := k.index[sk]; ok && op.entry.tstamp >= existing.tstamp {
+				delete(k.index, sk)
+			}
+			continue
+		}
+		if existing, ok := k.index[sk]; !ok || op.entry.tstamp >= existing.tstamp {
+			k.index[sk] = op.entry
+		}
+	}
+	k.mu.Unlock()
+}
+
 func (k *keydir) size() int {
 	k.mu.RLock()
 	n := len(k.index)

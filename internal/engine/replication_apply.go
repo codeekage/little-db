@@ -149,16 +149,6 @@ func (db *DB) handleReplicateApply(req *writeRequest) (bool, error) {
 		return false, fmt.Errorf("%w: %d trailing bytes after record of %d", ErrReplicationMalformed, len(raw)-n, n)
 	}
 
-	// Timestamp ratchet. The leader's timestamps are authoritative on
-	// the follower; we never advance backward. If we ever later become
-	// a leader (operator promote), the next locally generated
-	// timestamp must strictly exceed every leader timestamp we have
-	// seen — that is the invariant Put/Delete depend on for
-	// monotonicity.
-	if rec.tstamp > db.lastTstamp {
-		db.lastTstamp = rec.tstamp
-	}
-
 	// Pre-validate a BATCH body BEFORE we touch the segment. The
 	// outer record CRC only covers the bytes; a leader-side bug could
 	// produce a BATCH whose CRC matches but whose body is internally
@@ -219,30 +209,52 @@ func (db *DB) handleReplicateApply(req *writeRequest) (bool, error) {
 	case recordFlagBatch:
 		// batchEntries was decoded with recordStart=0 above; adjust
 		// every valuePos to the real absolute offset now that we know
-		// it. Walk in the encoded order and apply each entry with the
-		// same gating recovery uses. Sequential single-key calls (not
-		// applyBatch) because applyBatch is unconditional and would
-		// re-introduce the rollback problem we are gating against.
+		// it, and hand the whole list to applyBatchIfNewer. One write
+		// lock for the whole batch preserves BatchPut's whole-batch
+		// atomic-visibility contract for snapshot readers; the
+		// IfNewer variant keeps recovery-style timestamp gating so a
+		// re-delivered older batch cannot roll the keydir back.
+		ops := make([]keydirOp, len(batchEntries))
 		for i := range batchEntries {
 			e := &batchEntries[i]
 			absValuePos := e.valuePos + offset
 			switch e.flag {
 			case recordFlagPut:
-				db.keydir.putIfNewer(e.key, keydirEntry{
-					fileID:   db.active.id,
-					valuePos: absValuePos,
-					valueLen: uint32(len(e.value)),
-					tstamp:   rec.tstamp,
-				})
+				ops[i] = keydirOp{
+					key: append([]byte(nil), e.key...),
+					entry: keydirEntry{
+						fileID:   db.active.id,
+						valuePos: absValuePos,
+						valueLen: uint32(len(e.value)),
+						tstamp:   rec.tstamp,
+					},
+				}
 			case recordFlagTombstone:
-				if existing, ok := db.keydir.get(e.key); !ok || rec.tstamp >= existing.tstamp {
-					db.keydir.delete(e.key)
+				// On the delete branch only entry.tstamp matters;
+				// applyBatchIfNewer uses it for gating and ignores
+				// the rest.
+				ops[i] = keydirOp{
+					key:    append([]byte(nil), e.key...),
+					delete: true,
+					entry:  keydirEntry{tstamp: rec.tstamp},
 				}
 			}
 		}
+		db.keydir.applyBatchIfNewer(ops)
 	default:
 		// readRecord already rejected unknown flags; defensive.
 		return true, fmt.Errorf("%w: unknown record flag %d", ErrReplicationMalformed, rec.flag)
+	}
+
+	// Ratchet lastTstamp ONLY on a successful apply. Doing this
+	// earlier would let a malformed record (rejected by the pre-
+	// validation path) silently advance the writer's monotonic
+	// clock — a side-effect on a no-op outcome, which would push
+	// every subsequent locally-generated timestamp forward for no
+	// reason and complicate any future "rejected => fully rolled
+	// back" reasoning.
+	if rec.tstamp > db.lastTstamp {
+		db.lastTstamp = rec.tstamp
 	}
 
 	// Intentionally NO publishRecord call here — see the file-level
