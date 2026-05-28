@@ -1,0 +1,18 @@
+# Build artifacts
+/bin/
+/dist/
+
+# Local runtime state
+/data/
+
+# Go caches and test artifacts
+/.gocache/
+*.test
+*.out
+coverage.html
+
+# Editor / OS noise
+.DS_Store
+.vscode/
+.idea/
+*.swp
