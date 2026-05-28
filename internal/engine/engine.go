@@ -1252,6 +1252,22 @@ func (db *DB) rotateActive() error {
 	if err != nil {
 		return err
 	}
+	// Durably commit the new .seg dirent BEFORE publishing the manifest.
+	// createSegment only fsyncs the file's existence implicitly via
+	// subsequent operations; without an explicit parent-dir fsync here
+	// the manifest can land referencing next.id while the .seg dirent is
+	// still in a writeback buffer. A host crash in that window leaves the
+	// manifest pointing at a file the kernel never persisted — Open then
+	// fails with "manifest live segment missing".
+	dirSyncErr := syncDir(db.opts.Dir)
+	if hook := testRotatePreManifestSyncHook; hook != nil && dirSyncErr == nil {
+		dirSyncErr = hook()
+	}
+	if dirSyncErr != nil {
+		_ = next.close()
+		_ = os.Remove(next.path)
+		return fmt.Errorf("rotate: fsync data dir before manifest: %w", dirSyncErr)
+	}
 	// Compute the new live set under the segments RLock so we observe a
 	// consistent snapshot. The set includes the about-to-be-published new
 	// segment id; if writeManifest fails, we delete the orphan file and

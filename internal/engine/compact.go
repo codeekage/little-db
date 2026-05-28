@@ -440,6 +440,20 @@ func (db *DB) handleCompactCommit(cc *compactCommit) error {
 		newLive = append(newLive, cc.newSeg.id)
 	}
 
+	// Durably commit the new merged .seg + .hint dirents BEFORE publishing
+	// the manifest. The data file was fsync'd in step 4 of compact() and
+	// the hint file in step 5, but neither fsync covers the parent
+	// directory entries. Without this barrier the manifest can land
+	// referencing cc.newSeg.id while the dirent is still in writeback;
+	// a host crash in that window makes Open fail with "manifest live
+	// segment missing". Skipped for retire-only commits (no new dirents
+	// were created on this path).
+	if cc.newSeg != nil {
+		if err := syncDir(db.opts.Dir); err != nil {
+			return fmt.Errorf("compact: fsync data dir before manifest: %w", err)
+		}
+	}
+
 	manifestUncertain := false
 	if err := writeManifest(db.opts.Dir, newLive, activeID); err != nil {
 		if errors.Is(err, ErrManifestPublishedButUncertain) {

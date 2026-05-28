@@ -90,6 +90,16 @@ var ErrManifestPublishedButUncertain = errors.New("manifest: rename ok, durabili
 // production builds.
 var testManifestPostRenameHook func(dir string) error
 
+// testRotatePreManifestSyncHook, when non-nil, is invoked inside
+// rotateActive after the new segment file's parent directory has been
+// fsync'd but before the manifest write begins. A non-nil return value
+// is treated as a pre-manifest dir-fsync failure: the new .seg file is
+// unlinked, no manifest moves, and rotateActive returns an error to the
+// triggering caller. Lets unit tests cover the "createSegment succeeded
+// but the data-dir fsync did not confirm" path without filesystem fault
+// injection. Always nil in production builds.
+var testRotatePreManifestSyncHook func() error
+
 // manifestV1 is the on-disk schema. Keep it small and forward-compatible:
 // unknown fields are ignored by encoding/json, so adding fields later (e.g.
 // last-compaction timestamps) does not break older readers within v1.
@@ -247,16 +257,29 @@ func writeManifest(dir string, ids []uint32, active uint32) error {
 	// Fsync the directory so the rename is durable across a host crash.
 	// Without this, a crash could revert to the previous MANIFEST contents
 	// even though the rename returned success.
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("%w: %v", ErrManifestPublishedButUncertain, err)
+	}
+	return nil
+}
+
+// syncDir fsyncs (F_FULLFSYNC on darwin) the directory entry so prior
+// renames / creates inside dir are durable across a host crash. Callers
+// who need separation between "file dirent durable" and "manifest rename
+// durable" (e.g. createSegment followed by writeManifest) invoke this
+// directly before the manifest swap so the new .seg dirent is on the
+// platter before the manifest references it.
+func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
-		return fmt.Errorf("%w: open dir for fsync: %v", ErrManifestPublishedButUncertain, err)
+		return fmt.Errorf("open dir for fsync: %w", err)
 	}
 	if err := fullSync(d); err != nil {
 		d.Close()
-		return fmt.Errorf("%w: fsync dir: %v", ErrManifestPublishedButUncertain, err)
+		return fmt.Errorf("fsync dir: %w", err)
 	}
 	if err := d.Close(); err != nil {
-		return fmt.Errorf("%w: close dir: %v", ErrManifestPublishedButUncertain, err)
+		return fmt.Errorf("close dir: %w", err)
 	}
 	return nil
 }
