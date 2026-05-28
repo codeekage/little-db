@@ -48,6 +48,26 @@ const (
 // older DB.
 var errManifestMissing = errors.New("manifest: not present")
 
+// ErrManifestPublishedButUncertain is returned by writeManifest when the
+// rename succeeded (so the new manifest is visible on disk) but a
+// subsequent step in the durability sequence — opening the parent
+// directory, fsync'ing it, or closing it — failed. The on-disk state is
+// now in one of two safe configurations and the caller cannot tell which:
+//
+//  1. Host stays up or recovers cleanly: the new manifest is durable and
+//     references the new segment(s). This is the intended outcome.
+//  2. Host crashes before the directory entry is durable: the rename may
+//     revert, the new segment is treated as a leftover-from-crashed-
+//     compactor orphan by reconcileManifest, and the old manifest stands.
+//
+// In BOTH cases the new segment file must remain on disk. If the caller
+// rolls back by unlinking the new segment, case 1 becomes unrecoverable:
+// the next Open will read a manifest that references a missing segment
+// and fail hard. Callers MUST check errors.Is(err, ErrManifestPublished
+// ButUncertain) and, on a match, skip rollback and continue installing
+// the new segment into the in-memory state.
+var ErrManifestPublishedButUncertain = errors.New("manifest: rename ok, durability uncertain")
+
 // manifestV1 is the on-disk schema. Keep it small and forward-compatible:
 // unknown fields are ignored by encoding/json, so adding fields later (e.g.
 // last-compaction timestamps) does not break older readers within v1.
@@ -189,18 +209,26 @@ func writeManifest(dir string, ids []uint32, active uint32) error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("manifest: rename: %w", err)
 	}
+	// Past this point, the new MANIFEST is visible on disk. Any error
+	// from here on is reported under ErrManifestPublishedButUncertain so
+	// callers do NOT roll back the new segment — see the sentinel's
+	// godoc for the full rationale.
+	//
 	// Fsync the directory so the rename is durable across a host crash.
 	// Without this, a crash could revert to the previous MANIFEST contents
 	// even though the rename returned success.
 	d, err := os.Open(dir)
 	if err != nil {
-		return fmt.Errorf("manifest: open dir for fsync: %w", err)
+		return fmt.Errorf("%w: open dir for fsync: %v", ErrManifestPublishedButUncertain, err)
 	}
 	if err := fullSync(d); err != nil {
 		d.Close()
-		return fmt.Errorf("manifest: fsync dir: %w", err)
+		return fmt.Errorf("%w: fsync dir: %v", ErrManifestPublishedButUncertain, err)
 	}
-	return d.Close()
+	if err := d.Close(); err != nil {
+		return fmt.Errorf("%w: close dir: %v", ErrManifestPublishedButUncertain, err)
+	}
+	return nil
 }
 
 // reconcileManifest reads the manifest (if any) and intersects it with the

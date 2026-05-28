@@ -441,10 +441,27 @@ func (db *DB) handleCompactCommit(cc *compactCommit) error {
 	}
 
 	if err := writeManifest(db.opts.Dir, newLive, activeID); err != nil {
-		return fmt.Errorf("compact: persist manifest: %w", err)
+		if errors.Is(err, ErrManifestPublishedButUncertain) {
+			// MANIFEST is already visible referencing newSeg.id and
+			// excluding the oldSegs. The submit() error path would
+			// otherwise call cleanupNewSeg() which unlinks the new
+			// merged segment — that would leave the on-disk
+			// manifest pointing at a missing file and break next
+			// Open. Log loudly and proceed with the in-memory
+			// install + old-segment teardown so the running engine
+			// matches what a fresh Open would see.
+			db.log.Warn("manifest published with uncertain durability; continuing",
+				slog.String("op", "compact_commit"),
+				slog.Uint64("new_seg_id", uint64(cc.newSeg.id)),
+				slog.String("err", err.Error()))
+		} else {
+			return fmt.Errorf("compact: persist manifest: %w", err)
+		}
 	}
-	// Past this point: compaction is committed on disk. Failures from
-	// here on are in-memory consistency bugs, not data loss.
+	// Past this point: compaction is committed on disk (or, on the
+	// uncertain branch above, recovery will converge to either committed
+	// or "old manifest stands; new seg is an ignored orphan"). Failures
+	// from here on are in-memory consistency bugs, not data loss.
 
 	db.segmentsMu.Lock()
 	if cc.newSeg != nil {

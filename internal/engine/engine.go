@@ -1226,9 +1226,23 @@ func (db *DB) rotateActive() error {
 	db.segmentsMu.RUnlock()
 	live = append(live, next.id)
 	if err := writeManifest(db.opts.Dir, live, next.id); err != nil {
-		_ = next.close()
-		_ = os.Remove(next.path)
-		return fmt.Errorf("rotate: persist manifest: %w", err)
+		if errors.Is(err, ErrManifestPublishedButUncertain) {
+			// The new MANIFEST is already visible and references
+			// next.id. Rolling back by unlinking next.path would
+			// turn a recoverable durability gap into permanent
+			// corruption (next Open would refuse to start). Log
+			// loudly and fall through to install next into the
+			// in-memory state so the running engine matches what a
+			// fresh Open would see.
+			db.log.Warn("manifest published with uncertain durability; continuing",
+				slog.String("op", "rotate"),
+				slog.Uint64("new_active_id", uint64(next.id)),
+				slog.String("err", err.Error()))
+		} else {
+			_ = next.close()
+			_ = os.Remove(next.path)
+			return fmt.Errorf("rotate: persist manifest: %w", err)
+		}
 	}
 	db.segmentsMu.Lock()
 	db.segments[next.id] = next
