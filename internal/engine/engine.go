@@ -1238,9 +1238,11 @@ func (db *DB) handleBatch(req *writeRequest) (bool, error) {
 // BEFORE any append lands on it. Otherwise a host crash after the first
 // acked write to the new segment would lose data on restart — the new id
 // would not be in the manifest and reconcileManifest would treat the file
-// as an orphan. We therefore: create the file, write the manifest with the
-// new id appended, then publish under segmentsMu. The manifest write is
-// the durability barrier; an O(N) JSON serialization per rotation is
+// as an orphan. We therefore: create the file, fsync the data directory so
+// the new .seg dirent is durable (syncDir, pre-manifest barrier), write
+// the manifest with the new id appended, then publish under segmentsMu.
+// The pre-manifest syncDir + the manifest tmp→rename→dir-fsync together
+// form the durability barrier; an O(N) JSON serialization per rotation is
 // trivial against the cost of the new-file fsync and is amortised over
 // many writes per segment.
 func (db *DB) rotateActive() error {

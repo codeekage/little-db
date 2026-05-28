@@ -22,8 +22,10 @@ import (
 //  2. No manifest move happens: the engine remains writable after the
 //     hook is disarmed (the failure is recoverable, distinct from the
 //     post-manifest uncertain branch which is sticky).
-//  3. The would-be next .seg file is unlinked, so the next rotation can
-//     reuse that id without "file exists" failures.
+//  3. The would-be next .seg file is unlinked, so no orphan is left on
+//     disk. (nextID is monotonic and will skip the consumed id; the
+//     point of the unlink is avoiding an orphan / dirent collision, not
+//     id reuse.)
 //  4. Reads of previously-written keys keep working.
 func TestRotatePreManifestDirSyncFailureLeavesNoOrphan(t *testing.T) {
 	dir := t.TempDir()
