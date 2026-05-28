@@ -23,10 +23,13 @@ import (
 //     without inventing a second writer.
 //
 //   - The bytes are appended verbatim. We do NOT re-encode (which would
-//     mint a fresh CRC and timestamp) — the whole point is that
-//     follower segments are byte-identical to the leader's, so a future
-//     bit-rot detector or operator-side diff can compare segments
-//     directly and any divergence is a real bug.
+//     mint a fresh CRC and timestamp) — preserving the leader's record
+//     bytes is what lets a follower's reads match the leader's writes
+//     down to the CRC, and it keeps any future operator-side record
+//     diff meaningful. Note that segment IDs and segment boundaries
+//     are NOT preserved: a follower that joins mid-stream, or rotates
+//     on a different threshold, will package the same records into
+//     different segment files. Identity is per-record, not per-segment.
 //
 //   - The CRC is revalidated on apply. The wire codec already trusts
 //     the frame CRC inside ReadFrame, but the leader and follower are
@@ -41,6 +44,17 @@ import (
 //     timestamps that strictly exceed every leader timestamp it has
 //     seen — preserving the engine's "tstamp is monotonic per writer"
 //     invariant across the failover boundary.
+//
+//   - Keydir updates are timestamp-gated (putIfNewer / tstamp-gated
+//     delete), mirroring recovery. The leader-to-follower stream is
+//     ordered TCP and in normal operation records arrive in append
+//     order, but the engine-level API takes one record at a time and
+//     a future resume / replay path can legitimately re-deliver an
+//     older record. Unconditional put would let an older record roll
+//     back a newer one in the in-memory keydir even though recovery
+//     would later restore the newer record from disk — a visible
+//     divergence between live and post-restart state. Gating keeps
+//     the two views identical.
 //
 //   - publishRecord is intentionally NOT called on the apply path. A
 //     follower does not republish what it received: chained replication
@@ -145,6 +159,24 @@ func (db *DB) handleReplicateApply(req *writeRequest) (bool, error) {
 		db.lastTstamp = rec.tstamp
 	}
 
+	// Pre-validate a BATCH body BEFORE we touch the segment. The
+	// outer record CRC only covers the bytes; a leader-side bug could
+	// produce a BATCH whose CRC matches but whose body is internally
+	// inconsistent. Decoding now (with recordStart=0; we add the real
+	// offset after append) lets us reject the record cleanly without
+	// leaving a poison pill on disk that the next recovery scan would
+	// fail on. The decoded slices alias rec.value, which itself is a
+	// fresh allocation owned by this request, so retaining them across
+	// the append is safe.
+	var batchEntries []batchEntryDecoded
+	if rec.flag == recordFlagBatch {
+		decoded, derr := decodeBatchBody(rec.value, 0)
+		if derr != nil {
+			return false, fmt.Errorf("%w: batch body: %v", ErrReplicationMalformed, derr)
+		}
+		batchEntries = decoded
+	}
+
 	// Rotation. Same rule as handleBatch: if the active is non-empty
 	// and appending this record would push past the threshold, rotate.
 	// An empty active never rotates — a record larger than
@@ -157,8 +189,9 @@ func (db *DB) handleReplicateApply(req *writeRequest) (bool, error) {
 		}
 	}
 
-	// Append verbatim — the on-disk content must match the leader's
-	// byte-for-byte. No re-encode, no CRC regeneration.
+	// Append verbatim — the on-disk bytes must match the leader's
+	// byte-for-byte (segment IDs/boundaries may differ; record bytes
+	// do not). No re-encode, no CRC regeneration.
 	offset, err := db.active.append(raw)
 	if err != nil {
 		return false, err
@@ -167,51 +200,46 @@ func (db *DB) handleReplicateApply(req *writeRequest) (bool, error) {
 		return false, err
 	}
 
-	// Keydir update mirrors handleOne / handleBatch by record flag.
+	// Keydir update mirrors handleOne / handleBatch by record flag,
+	// but with recovery-style timestamp gating: an older record never
+	// overwrites a newer one. This keeps the live in-memory keydir
+	// identical to what a post-restart recovery would reconstruct.
 	switch rec.flag {
 	case recordFlagPut:
-		db.keydir.put(rec.key, keydirEntry{
+		db.keydir.putIfNewer(rec.key, keydirEntry{
 			fileID:   db.active.id,
 			valuePos: offset + int64(recordHeaderSize+len(rec.key)),
 			valueLen: uint32(len(rec.value)),
 			tstamp:   rec.tstamp,
 		})
 	case recordFlagTombstone:
-		db.keydir.delete(rec.key)
-	case recordFlagBatch:
-		// rec.value is the whole body for a BATCH record. Decode it
-		// with the same parser segment recovery uses; we get one
-		// keydirOp per inner entry, with absolute valuePos already
-		// computed against the record's start offset.
-		entries, err := decodeBatchBody(rec.value, offset)
-		if err != nil {
-			// We have already appended the bytes. The malformed-body
-			// case here means the leader produced a record whose
-			// outer CRC was fine but whose batch body is internally
-			// inconsistent — which is a leader-side bug, not a
-			// transit issue. Surface it as malformed. The follower's
-			// keydir does not advance; the record is on disk but
-			// invisible. On restart the recovery scanner will fail
-			// on the same body and the operator will see it.
-			return true, fmt.Errorf("%w: batch body: %v", ErrReplicationMalformed, err)
+		if existing, ok := db.keydir.get(rec.key); !ok || rec.tstamp >= existing.tstamp {
+			db.keydir.delete(rec.key)
 		}
-		ops := make([]keydirOp, len(entries))
-		for i, e := range entries {
-			if e.flag == recordFlagTombstone {
-				ops[i] = keydirOp{key: append([]byte(nil), e.key...), delete: true}
-				continue
-			}
-			ops[i] = keydirOp{
-				key: append([]byte(nil), e.key...),
-				entry: keydirEntry{
+	case recordFlagBatch:
+		// batchEntries was decoded with recordStart=0 above; adjust
+		// every valuePos to the real absolute offset now that we know
+		// it. Walk in the encoded order and apply each entry with the
+		// same gating recovery uses. Sequential single-key calls (not
+		// applyBatch) because applyBatch is unconditional and would
+		// re-introduce the rollback problem we are gating against.
+		for i := range batchEntries {
+			e := &batchEntries[i]
+			absValuePos := e.valuePos + offset
+			switch e.flag {
+			case recordFlagPut:
+				db.keydir.putIfNewer(e.key, keydirEntry{
 					fileID:   db.active.id,
-					valuePos: e.valuePos,
+					valuePos: absValuePos,
 					valueLen: uint32(len(e.value)),
 					tstamp:   rec.tstamp,
-				},
+				})
+			case recordFlagTombstone:
+				if existing, ok := db.keydir.get(e.key); !ok || rec.tstamp >= existing.tstamp {
+					db.keydir.delete(e.key)
+				}
 			}
 		}
-		db.keydir.applyBatch(ops)
 	default:
 		// readRecord already rejected unknown flags; defensive.
 		return true, fmt.Errorf("%w: unknown record flag %d", ErrReplicationMalformed, rec.flag)

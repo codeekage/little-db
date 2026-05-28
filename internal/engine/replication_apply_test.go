@@ -2,8 +2,10 @@ package engine
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"testing"
 	"time"
 )
@@ -358,4 +360,142 @@ func TestApplyReplicatedRecordSurvivesRestart(t *testing.T) {
 			t.Fatalf("reopened Get k%d: got %q want %q", i, got, want)
 		}
 	}
+}
+
+// encodeRawPutRecord hand-builds a PUT record with an arbitrary
+// timestamp. We avoid record.encode for tests that need a specific
+// tstamp because the writer goroutine normally controls it.
+func encodeRawPutRecord(tstamp int64, key, value []byte) []byte {
+	buf := make([]byte, recordHeaderSize+len(key)+len(value))
+	binary.LittleEndian.PutUint64(buf[4:12], uint64(tstamp))
+	buf[12] = recordFlagPut
+	binary.LittleEndian.PutUint32(buf[13:17], uint32(len(key)))
+	binary.LittleEndian.PutUint32(buf[17:21], uint32(len(value)))
+	copy(buf[recordHeaderSize:], key)
+	copy(buf[recordHeaderSize+len(key):], value)
+	sum := crc32.Checksum(buf[4:], crc32cTable)
+	binary.LittleEndian.PutUint32(buf[0:4], sum)
+	return buf
+}
+
+// encodeRawTombstoneRecord hand-builds a tombstone with a specific
+// timestamp.
+func encodeRawTombstoneRecord(tstamp int64, key []byte) []byte {
+	buf := make([]byte, recordHeaderSize+len(key))
+	binary.LittleEndian.PutUint64(buf[4:12], uint64(tstamp))
+	buf[12] = recordFlagTombstone
+	binary.LittleEndian.PutUint32(buf[13:17], uint32(len(key)))
+	binary.LittleEndian.PutUint32(buf[17:21], 0)
+	copy(buf[recordHeaderSize:], key)
+	sum := crc32.Checksum(buf[4:], crc32cTable)
+	binary.LittleEndian.PutUint32(buf[0:4], sum)
+	return buf
+}
+
+// TestApplyReplicatedRecordRejectsOlderPut pins the timestamp-gating
+// contract: applying an older PUT after a newer PUT must NOT roll back
+// the keydir. This mirrors recovery's putIfNewer semantics — the live
+// in-memory state must match what post-restart recovery would produce.
+func TestApplyReplicatedRecordRejectsOlderPut(t *testing.T) {
+	follower := openFollower(t)
+	tNew := int64(2000)
+	tOld := int64(1000)
+	newer := encodeRawPutRecord(tNew, []byte("k"), []byte("new"))
+	older := encodeRawPutRecord(tOld, []byte("k"), []byte("old"))
+
+	if err := follower.ApplyReplicatedRecord(newer); err != nil {
+		t.Fatalf("apply newer: %v", err)
+	}
+	if err := follower.ApplyReplicatedRecord(older); err != nil {
+		t.Fatalf("apply older: %v", err)
+	}
+	got, err := follower.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !bytes.Equal(got, []byte("new")) {
+		t.Fatalf("older PUT rolled back keydir: got %q want %q", got, "new")
+	}
+}
+
+// TestApplyReplicatedRecordRejectsOlderTombstone: same gating for the
+// tombstone path. An older tombstone arriving after a newer PUT must
+// not delete the key.
+func TestApplyReplicatedRecordRejectsOlderTombstone(t *testing.T) {
+	follower := openFollower(t)
+	tNew := int64(2000)
+	tOld := int64(1000)
+	newer := encodeRawPutRecord(tNew, []byte("k"), []byte("new"))
+	staleDelete := encodeRawTombstoneRecord(tOld, []byte("k"))
+
+	if err := follower.ApplyReplicatedRecord(newer); err != nil {
+		t.Fatalf("apply newer: %v", err)
+	}
+	if err := follower.ApplyReplicatedRecord(staleDelete); err != nil {
+		t.Fatalf("apply stale delete: %v", err)
+	}
+	got, err := follower.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !bytes.Equal(got, []byte("new")) {
+		t.Fatalf("stale tombstone deleted live key: got=%q err=%v", got, err)
+	}
+}
+
+// TestApplyReplicatedRecordMalformedBatchNotPersisted pins the HIGH
+// fix: a BATCH record whose outer CRC is valid but whose body declares
+// more entries than it carries must be rejected BEFORE the bytes hit
+// the segment. Otherwise the next restart would fail recovery on the
+// poison-pill record we ourselves wrote.
+func TestApplyReplicatedRecordMalformedBatchNotPersisted(t *testing.T) {
+	// Body: count=2 but only one (tiny) entry follows. Decoding
+	// fails with errBadBatchBody at entry 1.
+	body := make([]byte, 0)
+	count := make([]byte, 4)
+	binary.LittleEndian.PutUint32(count, 2)
+	body = append(body, count...)
+	// One PUT entry: inner_flag=0, klen=1, vlen=1, key='a', value='1'
+	entry := make([]byte, batchEntryHeaderSize+2)
+	entry[0] = recordFlagPut
+	binary.LittleEndian.PutUint32(entry[1:5], 1)
+	binary.LittleEndian.PutUint32(entry[5:9], 1)
+	entry[9] = 'a'
+	entry[10] = '1'
+	body = append(body, entry...)
+
+	// Outer header: keylen=0, vallen=len(body), flag=batch.
+	raw := make([]byte, recordHeaderSize+len(body))
+	binary.LittleEndian.PutUint64(raw[4:12], 12345)
+	raw[12] = recordFlagBatch
+	binary.LittleEndian.PutUint32(raw[13:17], 0)
+	binary.LittleEndian.PutUint32(raw[17:21], uint32(len(body)))
+	copy(raw[recordHeaderSize:], body)
+	sum := crc32.Checksum(raw[4:], crc32cTable)
+	binary.LittleEndian.PutUint32(raw[0:4], sum)
+
+	dir := t.TempDir()
+	follower, err := Open(Options{Dir: dir, MaxBatchEncodedSize: 16 * 1024 * 1024})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	sizeBefore := follower.active.size.Load()
+	if err := follower.ApplyReplicatedRecord(raw); !errors.Is(err, ErrReplicationMalformed) {
+		t.Fatalf("apply malformed batch: got %v want ErrReplicationMalformed", err)
+	}
+	if got := follower.active.size.Load(); got != sizeBefore {
+		t.Fatalf("active grew despite malformed batch: before=%d after=%d", sizeBefore, got)
+	}
+	if err := follower.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// The real regression: a fresh Open must succeed. If we had
+	// persisted the poison record, recovery would have aborted.
+	reopened, err := Open(Options{Dir: dir, MaxBatchEncodedSize: 16 * 1024 * 1024})
+	if err != nil {
+		t.Fatalf("reopen after rejected malformed batch: %v", err)
+	}
+	_ = reopened.Close()
 }

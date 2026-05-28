@@ -196,8 +196,11 @@ const (
 	// writeKindApply is a follower-side replication apply. The raw
 	// bytes are a complete bitcask record exactly as the leader wrote
 	// it (header + body, including the leader's CRC). The follower
-	// appends them verbatim so the on-disk content is byte-identical
-	// across leader and follower.
+	// appends them verbatim, so individual record bytes are
+	// byte-identical across leader and follower. Segment IDs and
+	// segment boundaries are not preserved (a follower that joined
+	// mid-stream, or rotates on a different threshold, will package
+	// the same records into different segment files).
 	writeKindApply
 )
 
