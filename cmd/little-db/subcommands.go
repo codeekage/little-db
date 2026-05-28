@@ -59,6 +59,17 @@ func parseFlags(fs *flag.FlagSet, args []string) error {
 							//   little-db ping --addr  ->  addr="--").
 							return fs.Parse(reordered)
 						}
+						// Refuse to consume the next token if it is itself
+						// a known flag (e.g. `--addr --dial-timeout 1ms`).
+						// Without this check the next flag was silently
+						// absorbed as the value (addr="--dial-timeout"),
+						// then --dial-timeout never reached fs.Parse and
+						// 1ms became a positional. Hand off to fs.Parse so
+						// the user sees the canonical missing-value error
+						// against the right flag name.
+						if isKnownFlagToken(fs, args[i+1]) {
+							return fs.Parse(reordered)
+						}
 						reordered = append(reordered, args[i+1])
 						i++
 					}
@@ -86,6 +97,20 @@ func needsFlagSentinel(positional []string) bool {
 		}
 	}
 	return false
+}
+
+// isKnownFlagToken reports whether tok looks like a flag (starts with
+// `-`, not bare `-`, not `--`) AND names a flag registered on fs. The
+// `=value` form is stripped before lookup so `--addr=foo` matches.
+func isKnownFlagToken(fs *flag.FlagSet, tok string) bool {
+	if len(tok) < 2 || tok[0] != '-' || tok == "--" {
+		return false
+	}
+	name := strings.TrimLeft(tok, "-")
+	if eq := strings.IndexByte(name, '='); eq >= 0 {
+		name = name[:eq]
+	}
+	return fs.Lookup(name) != nil
 }
 
 type connOpts struct {
