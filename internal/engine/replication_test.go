@@ -23,18 +23,40 @@ func decodeOnePublished(t *testing.T, raw []byte) *record {
 	return rec
 }
 
-// helper: open a DB with replication enabled.
+// helper: open a DB with replication enabled. The batch cap is lowered
+// to 16 MiB so it satisfies the Open-time constraint that
+// MaxBatchEncodedSize <= wire.MaxReplicationRecord (the default 64 MiB
+// would be rejected when ReplicationBufferSize > 0).
 func openReplicaDB(t *testing.T, bufSize int) *DB {
 	t.Helper()
 	db, err := Open(Options{
 		Dir:                   t.TempDir(),
 		ReplicationBufferSize: bufSize,
+		MaxBatchEncodedSize:   16 * 1024 * 1024,
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+// TestReplicationBatchCapExceedsWireRejected pins the Open-time check
+// that refuses to enable leader-mode replication with a batch cap
+// larger than a single REPLICATE_RECORD frame can carry. Without this
+// guard a batch could be appended locally only to find no legal way to
+// publish it, dropping the record silently while the on-disk state had
+// already advanced.
+func TestReplicationBatchCapExceedsWireRejected(t *testing.T) {
+	db, err := Open(Options{
+		Dir:                   t.TempDir(),
+		ReplicationBufferSize: 64,
+		MaxBatchEncodedSize:   33 * 1024 * 1024, // > wire.MaxReplicationRecord (~32 MiB)
+	})
+	if err == nil {
+		_ = db.Close()
+		t.Fatal("Open: expected error when MaxBatchEncodedSize > wire.MaxReplicationRecord, got nil")
+	}
 }
 
 // helper: decode one published record and assert it represents a single
@@ -264,7 +286,7 @@ func TestSubscribeRejectsSecond(t *testing.T) {
 
 // TestSubscribeAfterCloseFails verifies the closed-DB contract.
 func TestSubscribeAfterCloseFails(t *testing.T) {
-	db, err := Open(Options{Dir: t.TempDir(), ReplicationBufferSize: 4})
+	db, err := Open(Options{Dir: t.TempDir(), ReplicationBufferSize: 4, MaxBatchEncodedSize: 16 * 1024 * 1024})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -279,7 +301,7 @@ func TestSubscribeAfterCloseFails(t *testing.T) {
 // TestDBCloseClosesSubscription verifies clean end-of-stream signal: the
 // consumer's range loop terminates when the DB shuts down.
 func TestDBCloseClosesSubscription(t *testing.T) {
-	db, err := Open(Options{Dir: t.TempDir(), ReplicationBufferSize: 8})
+	db, err := Open(Options{Dir: t.TempDir(), ReplicationBufferSize: 8, MaxBatchEncodedSize: 16 * 1024 * 1024})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -364,14 +386,17 @@ func TestPublishedBytesAreIndependentCopies(t *testing.T) {
 // TestReplicationConcurrentWriters keeps the writer honest: with many
 // concurrent submitters, the published stream is still serialized (the
 // writer goroutine owns the publish point), no record is corrupted, and
-// drops are counted not silenced.
+// every record is observed when the buffer is sized above the total.
 func TestReplicationConcurrentWriters(t *testing.T) {
-	db := openReplicaDB(t, 256)
+	const W = 8
+	const N = 100
+	// Buffer comfortably above W*N so this test does not rely on the
+	// drainer goroutine keeping up under -race load. drop-on-overflow
+	// has its own dedicated test (TestReplicationDropOnOverflow).
+	db := openReplicaDB(t, 2*W*N)
 	sub, _ := db.Subscribe()
 	defer sub.Close()
 
-	const W = 8
-	const N = 100
 	var wg sync.WaitGroup
 	wg.Add(W)
 	for w := 0; w < W; w++ {

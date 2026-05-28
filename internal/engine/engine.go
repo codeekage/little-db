@@ -57,6 +57,7 @@ import (
 	"time"
 
 	"little-db/internal/logging"
+	"little-db/internal/wire"
 )
 
 // Sentinel errors that are part of the engine's public contract.
@@ -351,6 +352,17 @@ func Open(opts Options) (*DB, error) {
 	}
 	if opts.ReplicationBufferSize < 0 {
 		return nil, errors.New("engine: Options.ReplicationBufferSize must be >= 0")
+	}
+	// When replication is enabled, every successful BatchPut must fit
+	// in a single REPLICATE_RECORD frame (docs/replication.md §4.2:
+	// the leader ships the exact encoded record). Refuse to start with
+	// a batch cap larger than the wire-frame budget so an oversize
+	// batch can never be appended locally only to find no legal way
+	// to publish it. wire.MaxReplicationRecord is MaxFramePayload − 1
+	// (~32 MiB), so the operator must lower MaxBatchEncodedSize
+	// explicitly (the default is 64 MiB) when enabling replication.
+	if opts.ReplicationBufferSize > 0 && opts.MaxBatchEncodedSize > int64(wire.MaxReplicationRecord) {
+		return nil, fmt.Errorf("engine: Options.MaxBatchEncodedSize=%d exceeds wire.MaxReplicationRecord=%d; lower MaxBatchEncodedSize when ReplicationBufferSize>0", opts.MaxBatchEncodedSize, wire.MaxReplicationRecord)
 	}
 	if opts.Logger == nil {
 		opts.Logger = logging.Nop()

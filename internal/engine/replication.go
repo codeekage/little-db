@@ -79,18 +79,20 @@ func (s *Subscription) Close() error {
 	if s.closed {
 		return nil
 	}
-	s.closed = true
-	// Detach under db.subMu so we don't race with publishRecord taking
-	// the same mutex. After this point publishRecord sees db.sub == nil
-	// (or a different subscription, if the slot has been re-taken) and
-	// will never send on s.ch again, so closing the channel is safe.
+	// Hold subMu through detach AND close(ch). publishRecord takes the
+	// same mutex around its non-blocking send, so this ordering makes
+	// send-on-closed-channel structurally impossible: either
+	// publishRecord runs first and completes its select before we
+	// acquire subMu, or it blocks waiting for subMu and on entry sees
+	// db.sub == nil (we detached) and returns without touching s.ch.
 	s.db.subMu.Lock()
 	if s.db.sub == s {
 		s.db.sub = nil
 	}
-	s.db.subMu.Unlock()
-	s.detached.Store(true)
 	close(s.ch)
+	s.closed = true
+	s.detached.Store(true)
+	s.db.subMu.Unlock()
 	return nil
 }
 
@@ -151,9 +153,15 @@ func (db *DB) publishRecord(encoded []byte) {
 	if db.opts.ReplicationBufferSize <= 0 {
 		return
 	}
+	// Hold subMu for the entire publish, including the non-blocking
+	// send. This is what makes send-on-closed-channel impossible:
+	// Subscription.Close (and closeSubscriptionOnShutdown) also take
+	// subMu around close(ch), so the send and the close are mutually
+	// exclusive. The lock window is microseconds because the send is
+	// non-blocking (select default drops on a full buffer).
 	db.subMu.Lock()
+	defer db.subMu.Unlock()
 	sub := db.sub
-	db.subMu.Unlock()
 	if sub == nil {
 		return
 	}
@@ -172,18 +180,31 @@ func (db *DB) publishRecord(encoded []byte) {
 // subscription and closes the record channel; the consumer observes
 // channel-closed as a clean end-of-stream signal.
 func (db *DB) closeSubscriptionOnShutdown() {
+	// Snapshot the slot under subMu, then drop the lock so we can take
+	// the per-subscription closeMu in the same order Subscription.Close
+	// uses (closeMu → subMu). That ordering is what stops a concurrent
+	// consumer-side Close from double-closing s.ch.
 	db.subMu.Lock()
 	sub := db.sub
-	db.sub = nil
 	db.subMu.Unlock()
 	if sub == nil {
 		return
 	}
 	sub.closeMu.Lock()
-	if !sub.closed {
-		sub.closed = true
-		sub.detached.Store(true)
-		close(sub.ch)
+	defer sub.closeMu.Unlock()
+	if sub.closed {
+		return
 	}
-	sub.closeMu.Unlock()
+	// Re-take subMu so the close(ch) is mutually exclusive with any
+	// publishRecord caller that might still be on the lock-acquire path
+	// (the writer goroutine has exited by the time DB.Close reaches
+	// here, but the invariant is cheap to hold and documents intent).
+	db.subMu.Lock()
+	if db.sub == sub {
+		db.sub = nil
+	}
+	close(sub.ch)
+	sub.closed = true
+	sub.detached.Store(true)
+	db.subMu.Unlock()
 }

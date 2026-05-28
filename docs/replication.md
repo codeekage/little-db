@@ -95,10 +95,18 @@ defects.
 ### 3.1 Integration with the existing write path
 
 The single substantive change to the engine is **step 4**: after a record
-is durably appended on the leader, a copy of its encoded bytes is published
-to a buffered channel. The publish is non-blocking. If the channel is full,
-the record is dropped from the tail of the buffer and a `replication_lag_dropped`
-counter is incremented.
+is appended to the active segment, flushed to the kernel page cache, and
+made visible in the keydir — but *before* the burst's fsync — a copy of
+its encoded bytes is published to a buffered channel. The publish is
+non-blocking. If the channel is full, the record is dropped from the
+tail of the buffer and a `replication_lag_dropped` counter is
+incremented.
+
+Publishing before fsync is deliberate (§3.2 and §6): durability is G2's
+responsibility, not replication's. A follower may briefly hold a record
+the leader subsequently loses to a power-loss event before the burst
+fsync — the failure-mode row for that is the case `promote` exists to
+handle.
 
 **This is the SPEC §8 integration point**, written exactly as it was
 specified before any replication code existed. The frozen wire format
