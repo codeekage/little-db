@@ -185,6 +185,13 @@ func classifyErr(err error, stderr io.Writer) int {
 			return exitRemoteBad
 		case wire.StatusOverload, wire.StatusClosed:
 			return exitOverloaded
+		case wire.StatusFollowerReadOnly:
+			// Operator pointed a write at a follower. Treat as
+			// configuration error rather than transient overload
+			// so scripts that retry on OVERLOAD don't busy-loop;
+			// the leader-hint message in re.Msg already tells the
+			// operator where to send the write.
+			return exitRemoteBad
 		default:
 			return exitRemoteBad
 		}
@@ -217,6 +224,8 @@ func statusName(s wire.Status) string {
 		return "CLOSED"
 	case wire.StatusOverload:
 		return "OVERLOAD"
+	case wire.StatusFollowerReadOnly:
+		return "FOLLOWER_READ_ONLY"
 	default:
 		return fmt.Sprintf("status(0x%02x)", uint8(s))
 	}

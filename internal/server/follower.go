@@ -136,9 +136,10 @@ func NewFollower(leaderAddr string, db *engine.DB, opts FollowerOptions) *Follow
 	}
 }
 
-// Run is the follower main loop. It returns nil on ctx cancellation or
-// engine.ErrDBClosed when the local DB has been closed; any other
-// return value is a bug.
+// Run is the follower main loop. It returns nil on ctx cancellation;
+// engine.ErrDBClosed or engine.ErrWritesDisabled when the local engine
+// has gone into a terminal state and no amount of reconnecting can
+// recover. Any other return value is a bug.
 func (f *Follower) Run(ctx context.Context) error {
 	backoff := f.opts.InitialBackoff
 	for {
@@ -150,8 +151,11 @@ func (f *Follower) Run(ctx context.Context) error {
 		// (or a clean idle disconnect after a successful subscribe);
 		// it is the signal that resets the backoff.
 		progressed, err := f.runSession(ctx)
-		if errors.Is(err, engine.ErrDBClosed) {
-			f.log.Info("follower: local DB closed, exiting", slog.String("leader", f.leaderAddr))
+		if isFollowerTerminal(err) {
+			f.log.Info("follower: local engine terminal, exiting",
+				slog.String("leader", f.leaderAddr),
+				slog.String("err", err.Error()),
+			)
 			return err
 		}
 		if err != nil {
@@ -252,7 +256,7 @@ func (f *Follower) runSession(ctx context.Context) (bool, error) {
 			return true, fmt.Errorf("read record: %w", err)
 		}
 		if err := f.db.ApplyReplicatedRecord(raw); err != nil {
-			if errors.Is(err, engine.ErrDBClosed) {
+			if isFollowerTerminal(err) {
 				return true, err
 			}
 			// CRC or malformed: drop the stream. The reconnect will
@@ -260,4 +264,15 @@ func (f *Follower) runSession(ctx context.Context) (bool, error) {
 			return true, fmt.Errorf("apply: %w", err)
 		}
 	}
+}
+
+// isFollowerTerminal classifies engine errors that no amount of
+// reconnecting can recover from. ErrDBClosed means the local engine
+// has been torn down. ErrWritesDisabled means the writer-loop has
+// fenced itself off after an uncertain manifest publish: the on-disk
+// state is intact but no further appends are allowed until an operator
+// inspects the directory, so silently reconnecting and skipping
+// records would create a divergence that is hard to detect later.
+func isFollowerTerminal(err error) bool {
+	return errors.Is(err, engine.ErrDBClosed) || errors.Is(err, engine.ErrWritesDisabled)
 }

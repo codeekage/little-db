@@ -138,6 +138,10 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 	// Replication / follower knobs.
 	replicaOf := fs.String("replica-of", "",
 		"leader address; when set this server runs as a read-only follower and applies the leader's stream")
+	enableReplication := fs.Bool("enable-replication", false,
+		"leader-side: install the replication publisher and accept REPLICATE_SUBSCRIBE")
+	replicationBuffer := fs.Int("replication-buffer-size", 1024,
+		"leader-side: publisher channel depth in records (ignored unless --enable-replication)")
 
 	// Observability knobs.
 	logLevel := fs.String("log-level", "info",
@@ -153,6 +157,14 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "little-db serve: --data-dir is required")
 		return exitUsage
 	}
+	if *replicaOf != "" && *enableReplication {
+		fmt.Fprintln(stderr, "little-db serve: --replica-of and --enable-replication are mutually exclusive")
+		return exitUsage
+	}
+	if *replicationBuffer < 0 {
+		fmt.Fprintln(stderr, "little-db serve: --replication-buffer-size must be >= 0")
+		return exitUsage
+	}
 
 	lvl, err := logging.ParseLevel(*logLevel)
 	if err != nil {
@@ -166,7 +178,12 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 	}
 	logger := logging.New(stderr, lvl, format)
 
-	db, err := engine.Open(engine.Options{
+	// Leader-side replication is opt-in. Followers always open the
+	// engine WITHOUT a publisher (their writes come from the apply
+	// path, not from clients). A leader installs the publisher and
+	// flips Options.EnableReplication so the server accepts
+	// REPLICATE_SUBSCRIBE.
+	engineOpts := engine.Options{
 		Dir:                 *dataDir,
 		MaxSegmentSize:      *maxSegmentSize,
 		SyncOnPut:           *syncOnPut,
@@ -174,7 +191,11 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		MaxBatchEncodedSize: *maxBatchEncoded,
 		CompactionInterval:  *compactionInterval,
 		Logger:              logger,
-	})
+	}
+	if *enableReplication {
+		engineOpts.ReplicationBufferSize = *replicationBuffer
+	}
+	db, err := engine.Open(engineOpts)
 	if err != nil {
 		fmt.Fprintf(stderr, "little-db serve: open engine: %v\n", err)
 		return exitTransport
@@ -191,6 +212,7 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		WriteDeadline:             *writeDeadline,
 		MaxConcurrentRangeStreams: *maxRangeStreams,
 		MaxRangeResponseBytes:     *maxRangeBytes,
+		EnableReplication:         *enableReplication,
 		FollowerMode:              *replicaOf != "",
 		LeaderAddr:                *replicaOf,
 		Logger:                    logger,
@@ -202,6 +224,9 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 	if *replicaOf != "" {
 		fmt.Fprintf(stdout, "little-db: listening on %s (data-dir=%s, replica-of=%s)\n",
 			srv.Addr(), *dataDir, *replicaOf)
+	} else if *enableReplication {
+		fmt.Fprintf(stdout, "little-db: listening on %s (data-dir=%s, replication=on buffer=%d)\n",
+			srv.Addr(), *dataDir, *replicationBuffer)
 	} else {
 		fmt.Fprintf(stdout, "little-db: listening on %s (data-dir=%s)\n",
 			srv.Addr(), *dataDir)
