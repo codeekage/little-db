@@ -34,7 +34,7 @@ ultimately reduces to one of these four lines.
 
 | Option                          | Read latency | Write throughput | Recovery cost                | Implementation cost | Fit for take-home |
 | ------------------------------- | ------------ | ---------------- | ---------------------------- | ------------------- | ----------------- |
-| **Bitcask** (log + keydir)      | O(1) (1 seek) | very high (append) | O(live keys) — hint files reduce to O(1) per seg | low                 | ✅                |
+| **Bitcask** (log + keydir)      | O(1) (1 seek) | very high (append) | O(live keys / hint bytes) once the hint sidecar verifies | low                 | ✅                |
 | LSM tree (LevelDB-style)        | O(log N)     | very high        | O(WAL replay)                | high (compaction policy, bloom filters, level scheduling) | ❌ — months of work to get right |
 | B+tree                          | O(log N)     | moderate (in-place updates) | O(1) if WAL'd                 | high (page management, split/merge)                       | ❌                |
 | In-memory map + WAL (no segs)   | O(1)         | high             | O(WAL) — full replay         | trivial             | ❌ — does not satisfy "data outlives process" at scale; recovery time unbounded |
@@ -176,13 +176,15 @@ guarantees.
 At `Open`:
 
 1. Read the manifest (canonical live-segment set + active id).
-2. For each segment present in the manifest, prefer its `.hint` sidecar
-   if the timestamp + checksum match; otherwise scan the `.seg` for
-   records.
+2. For each **non-active** segment in the manifest, take the hint
+   fast-path if its `.hint` sidecar exists and verifies (magic, version,
+   `entry_count`, CRC32C); otherwise scan the `.seg` for records. The
+   **active** segment is always data-scanned so a trailing torn write
+   can be detected and truncated. (See SPEC §7.4.)
 3. Reconcile with directory contents: orphaned `.seg` files (not in the
    manifest) are deleted; missing `.seg` files (in the manifest but not
    on disk) abort `Open` with a clear error.
-4. Open the active segment for appends; truncate trailing torn records.
+4. Open the active segment for appends after its torn-tail trim.
 
 ### 4.2 Why a manifest at all?
 
@@ -312,14 +314,15 @@ branch. The relevant decisions for the design-rationale audience:
   fresh reads must talk to the leader. This is the same contract
   Postgres async streaming offers; not a defect.
 - **Manual failover is operator-driven; the wire protocol carries the
-  signal but does not perform the fence.** A `promote` CLI flips a
-  follower to leader; the new leader rejects writes intended for the old
-  leader’s clients with `FOLLOWER_READ_ONLY` (the freed status code from
-  the v0.1.0 reservation). Fencing the old leader — ensuring it cannot
-  keep accepting writes after promotion — is the operator’s job (kill
-  the process, revoke network access, STONITH). The replication design
-  doc is explicit that doing this in software without consensus is the
-  classic source of split-brain.
+  signal but does not perform the fence.** While a node runs as a
+  follower it rejects writes with `FOLLOWER_READ_ONLY` (the freed status
+  code from the v0.1.0 reservation). The `promote` CLI flips that node
+  to leader and it then accepts writes — the wire signal does not
+  reach the old leader at all. Fencing the old leader — ensuring it
+  cannot keep accepting writes after promotion — is the operator’s job
+  (kill the process, revoke network access, STONITH). The replication
+  design doc is explicit that doing this in software without consensus
+  is the classic source of split-brain.
 
 ---
 
