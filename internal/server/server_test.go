@@ -289,6 +289,32 @@ func TestServerBadFrameClassification(t *testing.T) {
 	}
 }
 
+// TestServerReplicateSubscribeBadRequest pins the placeholder dispatch
+// for REPLICATE_SUBSCRIBE while the leader-mode server-side handler is
+// staged on a later commit. Without an explicit case the request would
+// fall through to "unknown request type" / INTERNAL, which is wrong:
+// the opcode IS understood by the codec, the server simply does not
+// expose replication yet. Misconfigured followers should see a
+// deliberate BAD_REQUEST with an actionable message, not INTERNAL.
+// When the real handler lands the test should flip to assert OK and a
+// REPLICATE_RECORD stream.
+func TestServerReplicateSubscribeBadRequest(t *testing.T) {
+	_, addr := startServer(t, nil)
+	conn := dial(t, addr)
+
+	st, body := roundTrip(t, conn, &wire.ReplicateSubscribeRequest{})
+	if st != wire.StatusBadRequest {
+		t.Fatalf("status: got %v want BAD_REQUEST", st)
+	}
+	msg, err := wire.DecodeError(body)
+	if err != nil {
+		t.Fatalf("DecodeError: %v", err)
+	}
+	if msg != "replication not enabled on this server" {
+		t.Fatalf("msg: got %q", msg)
+	}
+}
+
 // --- 4. Error doesn't desync the connection -----------------------------
 
 func TestServerErrorDoesNotDesyncConnection(t *testing.T) {

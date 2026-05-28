@@ -53,12 +53,15 @@ const (
 	// replication is enabled the leader MUST be opened with
 	// MaxBatchEncodedSize <= MaxReplicationRecord, otherwise an oversize
 	// batch would be appended to the local segment successfully but the
-	// publisher would have no legal frame to wrap it in. Enforcement
-	// lives in the engine bring-up path (see the leader-mode option
-	// validation); chunked replication records were considered and
-	// rejected as out of scope for v0.1.0. A single-PUT max record
-	// (~16.06 MiB: 64 KiB key + 16 MiB value + ~28 B header) fits with
-	// comfortable slack.
+	// publisher would have no legal frame to wrap it in. This contract
+	// is currently documented only; the engine bring-up path does not
+	// validate it yet. The enforcement check (refuse to enable
+	// leader-mode replication when MaxBatchEncodedSize >
+	// MaxReplicationRecord) is a TODO that lands with the leader-mode
+	// commit. Chunked replication records were considered and rejected
+	// as out of scope for v0.1.0. A single-PUT max record (~16.06 MiB:
+	// 64 KiB key + 16 MiB value + ~28 B header) fits with comfortable
+	// slack.
 	MaxReplicationRecord = MaxFramePayload - 1
 )
 

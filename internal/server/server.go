@@ -435,6 +435,19 @@ func (s *Server) dispatchOnce(conn net.Conn, req wire.Request) (wire.Status, err
 
 	case *wire.ReadKeyRangeRequest:
 		return s.handleRange(conn, r)
+
+	case *wire.ReplicateSubscribeRequest:
+		// Replication is documented in docs/replication.md and the
+		// codec already understands the opcode, but the leader-side
+		// publisher and subscribe handler land on a later commit on
+		// bonus/replication. Until then, surface a deliberate
+		// BAD_REQUEST so misconfigured followers get an actionable
+		// signal instead of INTERNAL. Keeping the codec dispatch in
+		// place (vs. returning "unknown opcode") preserves the
+		// reviewable diff: when the server-side handler lands, only
+		// this case body changes.
+		_ = r
+		return wire.StatusBadRequest, s.writeError(conn, wire.StatusBadRequest, "replication not enabled on this server")
 	}
 	// Unknown concrete type; defensive.
 	return wire.StatusInternal, s.writeError(conn, wire.StatusInternal, "unknown request type")
