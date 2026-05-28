@@ -281,9 +281,9 @@ universal substrate; metrics are a derived view. We picked the substrate.
   encode); a trace would not add information a log line does not already
   carry.
 
-The pattern from `/memories/operability-magic-numbers.md` applies:
-env-tunable defaults are logged once at boot under a single structured
-log line, so any later "what was the pool size?" question is grep-able.
+Env-tunable defaults (pool sizes, timeouts, batch caps) are logged once
+at boot under a single structured log line, so any later "what was the
+configured value?" question is grep-able from the incident's logs.
 
 ---
 
