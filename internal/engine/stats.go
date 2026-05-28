@@ -20,6 +20,13 @@ type Stats struct {
 	// path flushes after every burst, so the buffer is small and the
 	// number is close to the on-disk file size at all times.
 	BytesOnDisk uint64
+
+	// ReplicationLagDropped counts records the leader's replication
+	// publisher dropped because the subscriber buffer was full. Always
+	// zero when Options.ReplicationBufferSize == 0. A non-zero and
+	// growing value is the canonical signal that a follower is falling
+	// behind faster than it can catch up. See docs/replication.md §3.
+	ReplicationLagDropped uint64
 }
 
 // Stats returns an observability snapshot of the engine.
@@ -53,7 +60,7 @@ func (db *DB) Stats() Stats {
 		bytes += uint64(seg.size.Load())
 	}
 	keys := uint64(db.keydir.size())
-	return Stats{KeyCount: keys, BytesOnDisk: bytes}
+	return Stats{KeyCount: keys, BytesOnDisk: bytes, ReplicationLagDropped: db.replicationDropped.Load()}
 }
 
 // statsLocked computes a Stats snapshot. The caller must hold
@@ -65,7 +72,8 @@ func (db *DB) statsLocked() Stats {
 		bytes += uint64(seg.size.Load())
 	}
 	return Stats{
-		KeyCount:    uint64(db.keydir.size()),
-		BytesOnDisk: bytes,
+		KeyCount:              uint64(db.keydir.size()),
+		BytesOnDisk:           bytes,
+		ReplicationLagDropped: db.replicationDropped.Load(),
 	}
 }

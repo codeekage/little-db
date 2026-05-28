@@ -163,6 +163,18 @@ type Options struct {
 	// Nil installs a no-op logger — the engine never emits a per-request
 	// log itself, so a Nop default has zero overhead.
 	Logger *slog.Logger
+
+	// ReplicationBufferSize installs an optional leader-side replication
+	// publisher. Zero (the default) disables replication entirely: no
+	// Subscribe handle, no per-write hook beyond a single inlined branch,
+	// no counters. A positive value installs a single-subscriber
+	// publisher whose buffered channel holds up to this many encoded
+	// records. The writer never blocks: when the buffer is full new
+	// records are dropped and Stats().ReplicationLagDropped is
+	// incremented. See docs/replication.md §3 for the design rationale
+	// and §6 for the failure-mode contract. Recommended starting value
+	// for production: 1024.
+	ReplicationBufferSize int
 }
 
 const (
@@ -287,6 +299,13 @@ type DB struct {
 	// Close so dashboards and health endpoints don't observe a sudden
 	// drop to zero during shutdown.
 	cachedStats atomic.Pointer[Stats]
+
+	// Replication publisher state. subMu protects the sub slot. When
+	// ReplicationBufferSize == 0 these fields are unused and the publish
+	// hook in processBurst becomes a single inlined branch.
+	subMu              sync.Mutex
+	sub                *Subscription
+	replicationDropped atomic.Uint64
 }
 
 // Open creates or opens a DB rooted at opts.Dir.
@@ -329,6 +348,9 @@ func Open(opts Options) (*DB, error) {
 	}
 	if opts.CompactionInterval < 0 {
 		return nil, errors.New("engine: Options.CompactionInterval must be >= 0")
+	}
+	if opts.ReplicationBufferSize < 0 {
+		return nil, errors.New("engine: Options.ReplicationBufferSize must be >= 0")
 	}
 	if opts.Logger == nil {
 		opts.Logger = logging.Nop()
@@ -574,6 +596,11 @@ func (db *DB) Close() error {
 		// it after the writer so a commit it had already sent is drained
 		// and replied to first.
 		db.compactorWG.Wait()
+
+		// Writer is quiescent, so publishRecord can no longer fire. Detach
+		// and close any active subscription; the consumer observes a
+		// channel-close as the clean end-of-stream signal.
+		db.closeSubscriptionOnShutdown()
 
 		// A *manual* DB.Compact() caller is not tracked by compactorWG —
 		// it runs on the caller's goroutine. It may be mid-scan against
@@ -1151,6 +1178,11 @@ func (db *DB) handleOne(req *writeRequest) (bool, error) {
 			tstamp:   rec.tstamp,
 		})
 	}
+	// Replication hook: publish the byte-identical record the writer
+	// just appended. No-op when ReplicationBufferSize == 0; never blocks
+	// (overflow increments Stats().ReplicationLagDropped). See
+	// internal/engine/replication.go for the design rationale.
+	db.publishRecord(db.encBuf)
 	return true, nil
 }
 
@@ -1227,6 +1259,9 @@ func (db *DB) handleBatch(req *writeRequest) (bool, error) {
 		bodyOff += batchEntryHeaderSize + len(e.Key) + valLen
 	}
 	db.keydir.applyBatch(ops)
+	// Replication hook: a BATCH lands as one record on the wire, same as
+	// it does on disk. See handleOne for the rationale.
+	db.publishRecord(db.encBuf)
 	return true, nil
 }
 
