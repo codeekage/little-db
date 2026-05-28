@@ -620,6 +620,87 @@ func TestServerReplicateSubscribeIdleLeaderReleasesSlot(t *testing.T) {
 	t.Fatalf("idle-leader slot reuse: got %v want OK", lastSt)
 }
 
+// TestServerReplicateSubscribeIgnoresPerRequestReadDeadline pins the
+// "no overall stream deadline" contract: a healthy idle follower must
+// remain subscribed indefinitely, regardless of the server's
+// per-request ReadDeadline. Before the read-deadline-clear landed, the
+// handler's read-watcher inherited the stale request deadline set by
+// handleConn; on a healthy idle follower the watcher's Read would time
+// out, peerGone would close, and the server would tear the
+// subscription down — exactly the failure the contract forbids.
+//
+// Setup: a server with a tiny ReadDeadline (50ms). Subscribe, wait
+// past the deadline (no writes), then Put on a separate connection and
+// assert the follower receives the record. If the handler still
+// honours the per-request deadline, the wait-past step ends the
+// stream and the follower's read returns EOF instead of a record.
+func TestServerReplicateSubscribeIgnoresPerRequestReadDeadline(t *testing.T) {
+	dir := t.TempDir()
+	db, err := engine.Open(engine.Options{
+		Dir:                   dir,
+		MaxBatchEncodedSize:   16 * 1024 * 1024,
+		ReplicationBufferSize: 64,
+	})
+	if err != nil {
+		t.Fatalf("engine.Open: %v", err)
+	}
+	srv := New(db, Options{
+		Addr:              "127.0.0.1:0",
+		ReadDeadline:      50 * time.Millisecond, // deliberately tiny
+		WriteDeadline:     2 * time.Second,
+		EnableReplication: true,
+	})
+	if err := srv.Bind(); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	addr := srv.Addr().String()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve() }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		<-serveErr
+		_ = db.Close()
+	})
+
+	// Subscribe.
+	follower := dial(t, addr)
+	frame, _ := wire.EncodeRequest(&wire.ReplicateSubscribeRequest{})
+	if _, err := follower.Write(frame); err != nil {
+		t.Fatalf("follower write: %v", err)
+	}
+	_ = follower.SetReadDeadline(time.Now().Add(2 * time.Second))
+	tag, _, err := wire.ReadFrame(follower)
+	if err != nil {
+		t.Fatalf("follower ack: %v", err)
+	}
+	if wire.Status(tag) != wire.StatusOK {
+		t.Fatalf("follower ack: got %v want OK", wire.Status(tag))
+	}
+
+	// Idle past the server's per-request ReadDeadline. If the handler
+	// inherited it, the read-watcher fires here and the subscription
+	// is gone by the time we do the Put below.
+	time.Sleep(200 * time.Millisecond)
+
+	// Drive one Put on a separate conn.
+	writer := dial(t, addr)
+	if st, _ := roundTrip(t, writer, &wire.PutRequest{Key: []byte("k"), Value: []byte("v")}); st != wire.StatusOK {
+		t.Fatalf("writer Put: got %v want OK", st)
+	}
+
+	// Follower should still receive the record.
+	_ = follower.SetReadDeadline(time.Now().Add(2 * time.Second))
+	raw, err := wire.ReadReplicateRecord(follower)
+	if err != nil {
+		t.Fatalf("ReadReplicateRecord after idle past ReadDeadline: %v", err)
+	}
+	if !bytes.Contains(raw, []byte("k")) || !bytes.Contains(raw, []byte("v")) {
+		t.Fatalf("record missing key/value: %x", raw)
+	}
+}
+
 // --- 4. Error doesn't desync the connection -----------------------------
 
 func TestServerErrorDoesNotDesyncConnection(t *testing.T) {

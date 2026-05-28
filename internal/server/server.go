@@ -699,6 +699,15 @@ func (s *Server) handleReplicateSubscribe(conn net.Conn, req *wire.ReplicateSubs
 	// Concurrency: net.Conn permits one concurrent reader + one
 	// concurrent writer, which is exactly the shape we have (watcher
 	// reads, this goroutine writes).
+	//
+	// Clear the per-request read deadline first. handleConn set one
+	// before dispatching us (so the request frame itself could time
+	// out), and deadlines persist across reads. If we left it in
+	// place, the watcher's Read on a perfectly healthy idle follower
+	// would hit ReadDeadline, close peerGone, and tear down the
+	// stream — exactly the failure mode the "no overall stream
+	// deadline" contract forbids. Zero value clears the deadline.
+	_ = conn.SetReadDeadline(time.Time{})
 	peerGone := make(chan struct{})
 	var watcherWG sync.WaitGroup
 	watcherWG.Add(1)
