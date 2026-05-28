@@ -30,6 +30,7 @@ import (
 	"little-db/internal/engine"
 	"little-db/internal/logging"
 	"little-db/internal/server"
+	"little-db/internal/wire"
 )
 
 const (
@@ -165,6 +166,44 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "little-db serve: --replication-buffer-size must be >= 0")
 		return exitUsage
 	}
+	if *enableReplication && *replicationBuffer == 0 {
+		// engine.Open silently treats ReplicationBufferSize<=0 as
+		// "replication disabled". Letting --enable-replication pair
+		// with buffer=0 would print "replication=on" while
+		// REPLICATE_SUBSCRIBE returns "not enabled" — a
+		// configuration-vs-behaviour mismatch that's exactly the
+		// kind of silent footgun this CLI exists to prevent.
+		fmt.Fprintln(stderr, "little-db serve: --replication-buffer-size must be > 0 when --enable-replication is set")
+		return exitUsage
+	}
+
+	// Replication imposes a hard upper bound on individual batch
+	// payloads: a single batch becomes one REPLICATE_RECORD frame and
+	// must fit in wire.MaxReplicationRecord (~32 MiB). If the operator
+	// did not explicitly set --max-batch-encoded-size, auto-cap the
+	// default to that bound when leader replication is on so that
+	// `little-db serve --enable-replication --data-dir ...` works out
+	// of the box. If they DID set it past the bound, reject at the
+	// CLI layer with a clear message instead of leaving engine.Open
+	// to surface its lower-level diagnostic.
+	if *enableReplication {
+		batchExplicit := false
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "max-batch-encoded-size" {
+				batchExplicit = true
+			}
+		})
+		wireCap := int64(wire.MaxReplicationRecord)
+		switch {
+		case !batchExplicit && *maxBatchEncoded > wireCap:
+			*maxBatchEncoded = wireCap
+		case batchExplicit && *maxBatchEncoded > wireCap:
+			fmt.Fprintf(stderr,
+				"little-db serve: --max-batch-encoded-size=%d exceeds wire.MaxReplicationRecord=%d; lower it or omit the flag to use the replication-safe default\n",
+				*maxBatchEncoded, wireCap)
+			return exitUsage
+		}
+	}
 
 	lvl, err := logging.ParseLevel(*logLevel)
 	if err != nil {
@@ -237,17 +276,19 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 	// writes with FOLLOWER_READ_ONLY), the follower applies the
 	// leader's stream into the same engine. Both share the same
 	// shutdown context so a single SIGINT brings them both down.
+	//
+	// follower.Run returns nil on ctx cancel, or a terminal error
+	// (ErrDBClosed / ErrWritesDisabled) when no amount of reconnecting
+	// can recover. Surfacing that error on followerErr lets the main
+	// select treat a dead follower the same as a dead listener: tear
+	// down the read-only server and exit non-zero, instead of serving
+	// stale data forever.
 	followerCtx, followerCancel := context.WithCancel(context.Background())
 	defer followerCancel()
-	followerDone := make(chan struct{})
+	followerErr := make(chan error, 1)
 	if *replicaOf != "" {
 		follower := server.NewFollower(*replicaOf, db, server.FollowerOptions{Logger: logger})
-		go func() {
-			defer close(followerDone)
-			_ = follower.Run(followerCtx)
-		}()
-	} else {
-		close(followerDone)
+		go func() { followerErr <- follower.Run(followerCtx) }()
 	}
 
 	// Serve in a goroutine; signal handler triggers Shutdown.
@@ -267,23 +308,39 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		followerCancel()
 		shutCtx, cancel := context.WithTimeout(context.Background(), *shutdownGrace)
 		defer cancel()
-		if err := srv.Shutdown(shutCtx); err != nil {
-			fmt.Fprintf(stderr, "little-db serve: shutdown: %v\n", err)
-			<-serveErr
-			<-followerDone
+		shutdownErr := srv.Shutdown(shutCtx)
+		<-serveErr
+		if *replicaOf != "" {
+			<-followerErr
+		}
+		if shutdownErr != nil {
+			fmt.Fprintf(stderr, "little-db serve: shutdown: %v\n", shutdownErr)
 			return exitTransport
 		}
-		<-serveErr
-		<-followerDone
 		return exitOK
 	case err := <-serveErr:
 		// Serve returned on its own — listener died unexpectedly.
 		followerCancel()
-		<-followerDone
+		if *replicaOf != "" {
+			<-followerErr
+		}
 		if err != nil {
 			fmt.Fprintf(stderr, "little-db serve: %v\n", err)
 			return exitTransport
 		}
 		return exitOK
+	case err := <-followerErr:
+		// Follower hit a terminal local-engine error (ErrDBClosed or
+		// ErrWritesDisabled). Keeping the read-only server up while
+		// no new records can ever be applied would serve
+		// monotonically staler data; better to exit non-zero and let
+		// the supervisor restart or alert.
+		stop()
+		fmt.Fprintf(stderr, "little-db serve: follower terminated: %v\n", err)
+		shutCtx, cancel := context.WithTimeout(context.Background(), *shutdownGrace)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+		<-serveErr
+		return exitTransport
 	}
 }
