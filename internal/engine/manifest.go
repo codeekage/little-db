@@ -64,9 +64,31 @@ var errManifestMissing = errors.New("manifest: not present")
 // rolls back by unlinking the new segment, case 1 becomes unrecoverable:
 // the next Open will read a manifest that references a missing segment
 // and fail hard. Callers MUST check errors.Is(err, ErrManifestPublished
-// ButUncertain) and, on a match, skip rollback and continue installing
-// the new segment into the in-memory state.
+// ButUncertain) and, on a match, skip the unlink.
+//
+// Post-uncertain in-memory disposition depends on the call site:
+//
+//   - Compaction (compactCommit): the new merged segment is immutable
+//     and self-contained, so the running engine can safely advance to
+//     the post-compaction view. Install the new segment, close fds on
+//     retired segments, but do NOT unlink retired segment files — both
+//     old and new live on disk until the next clean Open's sweepOrphans
+//     reconciles whichever the kernel preserved.
+//   - Active-segment rotation (rotateActive): the new segment is the
+//     writable active. Continuing to append into it after an uncertain
+//     publish risks acknowledging writes that vanish on host crash, so
+//     rotateActive instead sets engine.writesDisabled, leaves next.path
+//     on disk for sweepOrphans, and stops accepting writes. The next
+//     clean Open is the recovery path.
 var ErrManifestPublishedButUncertain = errors.New("manifest: rename ok, durability uncertain")
+
+// testManifestPostRenameHook, when non-nil, is invoked after the tmp→final
+// rename succeeds but before the directory fsync. A non-nil return value
+// from the hook is reported under ErrManifestPublishedButUncertain so unit
+// tests can exercise the "rename succeeded, durability uncertain" path
+// without depending on filesystem-level fault injection. Always nil in
+// production builds.
+var testManifestPostRenameHook func(dir string) error
 
 // manifestV1 is the on-disk schema. Keep it small and forward-compatible:
 // unknown fields are ignored by encoding/json, so adding fields later (e.g.
@@ -214,6 +236,14 @@ func writeManifest(dir string, ids []uint32, active uint32) error {
 	// callers do NOT roll back the new segment — see the sentinel's
 	// godoc for the full rationale.
 	//
+	// Test-only injection point: lets unit tests simulate a dir-fsync
+	// failure deterministically without root or filesystem tricks. nil in
+	// production.
+	if hook := testManifestPostRenameHook; hook != nil {
+		if err := hook(dir); err != nil {
+			return fmt.Errorf("%w: post-rename hook: %v", ErrManifestPublishedButUncertain, err)
+		}
+	}
 	// Fsync the directory so the rename is durable across a host crash.
 	// Without this, a crash could revert to the previous MANIFEST contents
 	// even though the rename returned success.
