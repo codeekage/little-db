@@ -72,20 +72,31 @@ func dial(t *testing.T, addr string) net.Conn {
 // roundTrip writes one request and reads one response frame.
 func roundTrip(t *testing.T, conn net.Conn, req wire.Request) (wire.Status, []byte) {
 	t.Helper()
+	st, body, err := tryRoundTrip(conn, req)
+	if err != nil {
+		t.Fatalf("roundTrip: %v", err)
+	}
+	return st, body
+}
+
+// tryRoundTrip mirrors roundTrip but returns errors instead of calling
+// t.Fatalf, so callers running in a goroutine can report I/O failures
+// without crashing the goroutine before delivering a result.
+func tryRoundTrip(conn net.Conn, req wire.Request) (wire.Status, []byte, error) {
 	frame, err := wire.EncodeRequest(req)
 	if err != nil {
-		t.Fatalf("EncodeRequest: %v", err)
+		return 0, nil, fmt.Errorf("EncodeRequest: %w", err)
 	}
 	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	if _, err := conn.Write(frame); err != nil {
-		t.Fatalf("write: %v", err)
+		return 0, nil, fmt.Errorf("write: %w", err)
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	tag, body, err := wire.ReadFrame(conn)
 	if err != nil {
-		t.Fatalf("ReadFrame: %v", err)
+		return 0, nil, fmt.Errorf("ReadFrame: %w", err)
 	}
-	return wire.Status(tag), body
+	return wire.Status(tag), body, nil
 }
 
 // --- 1. End-to-end -------------------------------------------------------
@@ -1458,5 +1469,116 @@ func TestPromoteHookErrorReturnsInternal(t *testing.T) {
 	st, _ = roundTrip(t, conn, &wire.PutRequest{Key: []byte("k"), Value: []byte("v")})
 	if st != wire.StatusFollowerReadOnly {
 		t.Fatalf("post-failed-PROMOTE PUT: got %v want FOLLOWER_READ_ONLY", st)
+	}
+}
+
+// TestPromoteHookFailureAllowsRetry pins finding #1 from review: a
+// failed OnPromote must NOT consume any one-shot guard. The operator
+// (or a supervisor) must be able to retry, see the hook re-run, and
+// see the gate flip on success. The original sync.Once design swallowed
+// the second attempt and returned OK without promoting.
+func TestPromoteHookFailureAllowsRetry(t *testing.T) {
+	var calls atomic.Int32
+	_, addr := startServer(t, func(o *Options) {
+		o.FollowerMode = true
+		o.LeaderAddr = "leader.example:4242"
+		o.OnPromote = func(ctx context.Context) error {
+			if calls.Add(1) == 1 {
+				return errors.New("transient drain failure")
+			}
+			return nil
+		}
+	})
+	conn := dial(t, addr)
+	if st, _ := roundTrip(t, conn, &wire.PromoteRequest{}); st != wire.StatusInternal {
+		t.Fatalf("first PROMOTE: got %v want INTERNAL", st)
+	}
+	st, body := roundTrip(t, conn, &wire.PromoteRequest{})
+	if st != wire.StatusOK {
+		msg, _ := wire.DecodeError(body)
+		t.Fatalf("retry PROMOTE: got %v (%s) want OK", st, msg)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("OnPromote called %d times, want 2 (retry must re-invoke)", got)
+	}
+	st, _ = roundTrip(t, conn, &wire.PutRequest{Key: []byte("k"), Value: []byte("v")})
+	if st != wire.StatusOK {
+		t.Fatalf("post-retry PUT: got %v want OK", st)
+	}
+}
+
+// TestPromoteSerializesConcurrentCallers pins the other half of
+// finding #1: two simultaneous PROMOTEs must not both pass the
+// followerMode check, both run the hook, and both return OK. promoteMu
+// serializes them so exactly one runs the hook; the loser sees the
+// flipped gate and returns BAD_REQUEST.
+func TestPromoteSerializesConcurrentCallers(t *testing.T) {
+	var calls atomic.Int32
+	gate := make(chan struct{})
+	hookEntered := make(chan struct{}, 1)
+	_, addr := startServer(t, func(o *Options) {
+		o.FollowerMode = true
+		o.LeaderAddr = "leader.example:4242"
+		o.OnPromote = func(ctx context.Context) error {
+			calls.Add(1)
+			select {
+			case hookEntered <- struct{}{}:
+			default:
+			}
+			<-gate
+			return nil
+		}
+	})
+	c1 := dial(t, addr)
+	c2 := dial(t, addr)
+
+	type result struct {
+		st  wire.Status
+		err error
+	}
+	results := make(chan result, 2)
+	for _, c := range []net.Conn{c1, c2} {
+		conn := c
+		go func() {
+			st, _, err := tryRoundTrip(conn, &wire.PromoteRequest{})
+			results <- result{st: st, err: err}
+		}()
+	}
+
+	// Block until the winner is actually inside the hook. Without
+	// this the test can race: gate closes before either caller
+	// reaches handlePromote, the winner runs through and flips the
+	// gate, and the loser arrives to a non-follower server and
+	// returns BAD_REQUEST without ever contending on promoteMu \u2014
+	// the test passes for the wrong reason and the mutex
+	// serialization is never exercised. Waiting for hookEntered
+	// guarantees the winner holds promoteMu; the small sleep gives
+	// the loser time to land in handlePromote and block on the
+	// mutex (we can't directly observe that wait without hooking
+	// the mutex itself).
+	<-hookEntered
+	time.Sleep(50 * time.Millisecond)
+	close(gate)
+
+	var ok, badReq int
+	for i := 0; i < 2; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Fatalf("roundTrip: %v", r.err)
+		}
+		switch r.st {
+		case wire.StatusOK:
+			ok++
+		case wire.StatusBadRequest:
+			badReq++
+		default:
+			t.Fatalf("unexpected status %v", r.st)
+		}
+	}
+	if ok != 1 || badReq != 1 {
+		t.Fatalf("got ok=%d badReq=%d, want exactly one of each", ok, badReq)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("OnPromote called %d times, want exactly 1", got)
 	}
 }

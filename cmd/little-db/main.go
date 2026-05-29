@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -261,13 +262,30 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 	// select for the same value (a real bug surfaced in smoke
 	// testing: both sides received followerErr, main won, the hook
 	// hung, the PROMOTE client timed out, and the server shut
-	// itself down). When --replica-of is empty, the goroutine is
-	// never started and these channels are inert.
+	// itself down). followerRunErr captures Run's return value when
+	// the promotion path suppresses it on followerErr — the hook
+	// reads it to detect "engine died DURING the drain" (e.g. an
+	// ApplyReplicatedRecord hit ErrDBClosed mid-promotion). Without
+	// that capture the server would happily flip the gate writable
+	// even though the local engine is dead. When --replica-of is
+	// empty, the goroutine is never started and these channels are
+	// inert.
 	followerCtx, followerCancel := context.WithCancel(context.Background())
 	defer followerCancel()
 	followerErr := make(chan error, 1)
 	followerDone := make(chan struct{})
 	var promoted atomic.Bool
+	var followerRunErr atomic.Pointer[error]
+	// forceShutdown is closed by the OnPromote hook when its drain
+	// fails (either timed out, or the follower returned a terminal
+	// local-engine error during the drain). Either way the server is
+	// in a state where continuing to serve read-only data is wrong
+	// — the apply loop is gone or the engine is dead. Wrapped in
+	// sync.Once so two failed PROMOTEs racing through the failure
+	// path don't double-close and panic. The main select treats it
+	// as a graceful-shutdown trigger.
+	forceShutdown := make(chan struct{})
+	var forceShutdownOnce sync.Once
 
 	serverOpts := server.Options{
 		Addr:                      *addr,
@@ -296,8 +314,24 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 			followerCancel()
 			select {
 			case <-followerDone:
+				// Drain completed. If the follower exited with a
+				// terminal local-engine error (ErrDBClosed or
+				// ErrWritesDisabled) during the drain, flipping the
+				// gate would expose a dead engine to client writes.
+				// Fail the promotion AND force process shutdown so
+				// the supervisor restarts cleanly.
+				if boxed := followerRunErr.Load(); boxed != nil && *boxed != nil {
+					forceShutdownOnce.Do(func() { close(forceShutdown) })
+					return fmt.Errorf("follower exited during drain: %w", *boxed)
+				}
 				return nil
 			case <-ctx.Done():
+				// Drain didn't complete. The follower is cancelled
+				// and its error suppressed (promoted=true). The
+				// server will refuse the gate-flip (hookErr != nil)
+				// but without forcing shutdown the process would
+				// keep serving read-only data with no apply loop.
+				forceShutdownOnce.Do(func() { close(forceShutdown) })
 				return fmt.Errorf("follower drain: %w", ctx.Err())
 			}
 		}
@@ -336,6 +370,15 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		follower := server.NewFollower(*replicaOf, db, server.FollowerOptions{Logger: logger})
 		go func() {
 			err := follower.Run(followerCtx)
+			// Store the run result BEFORE consulting promoted: a
+			// terminal exit that lands microseconds before PROMOTE
+			// flips `promoted` must still be visible to the hook,
+			// otherwise OnPromote sees followerDone closed,
+			// followerRunErr nil, and returns OK \u2014 flipping the gate
+			// writable on a dead engine. Storing first closes that
+			// window (the hook reads after the close-of-followerDone
+			// it's waiting on, which happens-after this Store).
+			followerRunErr.Store(&err)
 			if !promoted.Load() {
 				followerErr <- err
 			}
@@ -391,6 +434,17 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		// the goroutine above).
 		stop()
 		fmt.Fprintf(stderr, "little-db serve: follower terminated: %v\n", err)
+		shutCtx, cancel := context.WithTimeout(context.Background(), *shutdownGrace)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+		<-serveErr
+		return exitTransport
+	case <-forceShutdown:
+		// PROMOTE hook's follower drain timed out. See the
+		// forceShutdown comment at declaration for the full
+		// rationale.
+		stop()
+		fmt.Fprintln(stderr, "little-db serve: promote drain timed out; shutting down to avoid serving stale read-only data")
 		shutCtx, cancel := context.WithTimeout(context.Background(), *shutdownGrace)
 		defer cancel()
 		_ = srv.Shutdown(shutCtx)

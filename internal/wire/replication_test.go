@@ -51,9 +51,9 @@ func TestReplicateSubscribeRejectsOversizeTag(t *testing.T) {
 
 func TestDecodeReplicateSubscribeRejectsTruncated(t *testing.T) {
 	cases := map[string][]byte{
-		"truncated tag_len header":    {0x00, 0x00, 0x01},
-		"declared len exceeds bytes":  append([]byte{0x00, 0x00, 0x00, 0x10}, bytes.Repeat([]byte{'x'}, 8)...),
-		"trailing bytes after tag":    append([]byte{0x00, 0x00, 0x00, 0x02}, []byte{'a', 'b', 'c'}...),
+		"truncated tag_len header":   {0x00, 0x00, 0x01},
+		"declared len exceeds bytes": append([]byte{0x00, 0x00, 0x00, 0x10}, bytes.Repeat([]byte{'x'}, 8)...),
+		"trailing bytes after tag":   append([]byte{0x00, 0x00, 0x00, 0x02}, []byte{'a', 'b', 'c'}...),
 		"declared len above MaxLen": func() []byte {
 			b := make([]byte, 4)
 			binary.BigEndian.PutUint32(b, MaxResumeTagLen+1)

@@ -109,7 +109,8 @@ func WriteReplicateSubscribe(w io.Writer, resumeTag []byte) error {
 }
 
 // decodeReplicateSubscribe parses a REPLICATE_SUBSCRIBE body.
-func decodeReplicateSubscribe(body []byte) (*ReplicateSubscribeRequest, error) {	if len(body) < 4 {
+func decodeReplicateSubscribe(body []byte) (*ReplicateSubscribeRequest, error) {
+	if len(body) < 4 {
 		return nil, asProtocolErr("REPLICATE_SUBSCRIBE: truncated tag_len header (have %d, want >=4)", len(body))
 	}
 	tlen := binary.BigEndian.Uint32(body[0:4])

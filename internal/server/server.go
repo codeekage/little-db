@@ -170,9 +170,16 @@ type Server struct {
 	// Promote so a running server can be flipped without a restart.
 	// Read on the per-request hot path; the atomic is cheaper than a
 	// mutex and the only writer is the PROMOTE handler under
-	// promoteOnce.
+	// promoteMu.
 	followerMode atomic.Bool
-	promoteOnce  sync.Once
+	// promoteMu serializes PROMOTE requests so two simultaneous
+	// callers cannot both pass the followerMode check and both run
+	// the OnPromote hook. Plain mutex (not sync.Once) so a hook
+	// failure leaves followerMode=true AND allows the operator to
+	// retry — a Once would consume the slot on failure, and the
+	// next PROMOTE would silently return OK without ever running
+	// the hook or actually promoting.
+	promoteMu sync.Mutex
 }
 
 // New constructs a Server bound to db. Options defaults are applied.
@@ -550,31 +557,31 @@ func (s *Server) dispatchOnce(conn net.Conn, req wire.Request) (wire.Status, err
 // the moment followerMode is false, dispatchOnce starts forwarding
 // writes to the engine, and any in-flight ApplyReplicatedRecord on
 // the follower side would land concurrently and corrupt the
-// lastTstamp ratchet. sync.Once guards the hook so two simultaneous
-// PROMOTE requests can't both run it.
+// lastTstamp ratchet. promoteMu serializes concurrent PROMOTEs and,
+// unlike a sync.Once, preserves retry-after-failure: a hook that
+// returns an error leaves the gate up and the next PROMOTE re-runs
+// the hook from scratch.
 func (s *Server) handlePromote(conn net.Conn) (wire.Status, error) {
+	s.promoteMu.Lock()
+	defer s.promoteMu.Unlock()
 	if !s.followerMode.Load() {
 		return wire.StatusBadRequest, s.writeError(conn, wire.StatusBadRequest, "not a follower")
 	}
 	var hookErr error
-	s.promoteOnce.Do(func() {
-		if hook := s.opts.OnPromote; hook != nil {
-			// Bound the hook by the server's write deadline so a
-			// stuck follower drain can't pin the request goroutine
-			// forever. The connection itself already has the same
-			// deadline armed by handleConn for the response write.
-			ctx, cancel := context.WithTimeout(context.Background(), s.opts.WriteDeadline)
-			defer cancel()
-			hookErr = hook(ctx)
-		}
-		if hookErr == nil {
-			s.followerMode.Store(false)
-			s.log.Info("server promoted: follower mode disabled")
-		}
-	})
+	if hook := s.opts.OnPromote; hook != nil {
+		// Bound the hook by the server's write deadline so a
+		// stuck follower drain can't pin the request goroutine
+		// forever. The connection itself already has the same
+		// deadline armed by handleConn for the response write.
+		ctx, cancel := context.WithTimeout(context.Background(), s.opts.WriteDeadline)
+		defer cancel()
+		hookErr = hook(ctx)
+	}
 	if hookErr != nil {
 		return wire.StatusInternal, s.writeError(conn, wire.StatusInternal, "promote: "+hookErr.Error())
 	}
+	s.followerMode.Store(false)
+	s.log.Info("server promoted: follower mode disabled")
 	return wire.StatusOK, s.writeFrame(conn, uint8(wire.StatusOK), nil)
 }
 
