@@ -29,7 +29,7 @@ their bytes between the API call and the platter.
 | G5           | Predictable under load            | p99 stays ≤ 10 ms (Get) / ≤ 50 ms (Put) during a sustained mixed workload (70/20/10 read/write/delete); SPEC-scale run is 5 minutes | `TestReq5_PredictableUnderLoad`                                          |
 | G6           | API surface complete              | All five required operations behave per §4                                                                                          | `TestReq6_APISurfaceComplete`                                            |
 | G7           | Network-available                 | Engine reachable over TCP from a separate process                                                                                   | `TestReq7_NetworkAvailable`                                              |
-| G8 _(bonus)_ | Replicates to followers           | Single-leader async replication; manual failover documented                                                                         | `TestReq8_ReplicationBonus` — **deferred to `bonus/replication` branch** |
+| G8 _(bonus)_ | Replicates to followers           | Single-leader async replication; manual failover documented                                                                         | `TestReq8_ReplicationBonus` — **implemented on `bonus/replication`** (this branch)        |
 
 ## 3. Scope
 
@@ -42,7 +42,7 @@ their bytes between the API call and the platter.
 - The five required API operations: `Put`, `Read`, `ReadKeyRange`, `BatchPut`, `Delete`.
 - TCP server with a custom length-prefixed binary protocol.
 - A minimal CLI client.
-- Async single-leader replication — **planned bonus branch only**; integration point documented here, not implemented on `main`.
+- Async single-leader replication — implemented on `bonus/replication` (this branch); not present on `main`.
 
 ### 3.2 Out of scope
 
@@ -690,12 +690,13 @@ dead-byte trigger is deferred to a later operability pass.
 | 5     | TCP server + wire protocol                                        | ✅ done                                          | G7                             |
 | 6     | CLI client                                                        | ✅ done                                          | reviewer ergonomics            |
 | 7     | Benchmarks + compliance test file                                 | ✅ done                                          | G2, G3, G4, G5 (proof)         |
-| 8     | Async replication (bonus)                                         | ➖ deferred (planned `bonus/replication` branch) | G8                             |
+| 8     | Async replication (bonus)                                         | ✅ done on `bonus/replication`                  | G8                             |
 | 9     | README + ops docs                                                 | ✅ done                                          | NF7, project completion        |
 
 Core single-node flow is complete on `main`. Batch 8 is bonus scope and
-intentionally lives on a separate branch so `main` ships without
-half-finished cluster code on the hot path.
+lives on `bonus/replication` (this branch) — leader/follower SUBSCRIBE
+stream + manual PROMOTE failover, with `TestReq8_ReplicationBonus`
+unskipped.
 
 ## 15. Verification plan
 
@@ -722,10 +723,11 @@ make bench               # go test ./internal/engine -bench=. -benchmem -benchti
 make compliance-heavy    # LITTLEDB_HEAVY=1 — full-scale 1M-key / 5-min workload + G4
 ```
 
-Each of G1–G7 has a named test in `internal/engine/compliance_test.go`
-(written in batch 7) that asserts the measurable target from §2. G8 is
-the bonus; `TestReq8_ReplicationBonus` is present as a `t.Skip` marker
-and exercised only on the `bonus/replication` branch.
+Each of G1–G8 has a named test in `internal/engine/compliance_test.go`
+(G1–G7 from batch 7, G8 added on `bonus/replication`) that asserts the
+measurable target from §2. On this branch, `TestReq8_ReplicationBonus`
+is unskipped and exercises the full leader/follower SUBSCRIBE stream +
+manual PROMOTE failover end-to-end.
 
 ## 16. Risks
 

@@ -14,7 +14,7 @@ help: ## Print this menu
 	@echo "  make verify              SPEC §15 one-command verification (vet + race tests + compliance)"
 	@echo "  make vet                 go vet ./..."
 	@echo "  make test                go test ./... -race -count=1 -skip '^TestReq' (TestReq* is covered by 'compliance')"
-	@echo "  make compliance          go test -run TestReq -v (SPEC §2 G1–G7, default workload)"
+	@echo "  make compliance          go test -run TestReq -v (SPEC §2 G1–G8, default workload)"
 	@echo "  make compliance-heavy    same, LITTLEDB_HEAVY=1 (SPEC-scale workload + G4)"
 	@echo "  make bench               go test ./internal/engine -bench=. -benchmem -benchtime=$(BENCHTIME)"
 	@echo "  make build               go build ./cmd/little-db"
@@ -53,6 +53,6 @@ clean: ## Drop test cache and built binaries
 .PHONY: verify
 verify: vet test compliance
 	@echo
-	@echo "verify OK: vet + race tests + SPEC §2 G1–G7 compliance all green."
+	@echo "verify OK: vet + race tests + SPEC §2 G1–G8 compliance all green."
 	@echo "(Run 'make compliance-heavy' for the full-scale 1M-key / 5-min workload."
 	@echo " Run 'make bench' for benchmark numbers.)"

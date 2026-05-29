@@ -31,9 +31,9 @@ modes) live in [docs/ops.md](docs/ops.md).
 A deliberately short list of non-goals (see [docs/SPEC.md §17](docs/SPEC.md)):
 no transactions across keys, no secondary indexes, no TTLs, no
 encryption-at-rest, no HTTP/REST, no automatic failover, no Windows
-support. Replication is deferred to a planned
-[separate branch](#replication-bonus) and is **not implemented** on
-`main`.
+support. Replication is implemented on the
+[`bonus/replication` branch](#replication-bonus) (this branch); `main`
+is intentionally single-node.
 
 ---
 
@@ -170,7 +170,7 @@ That expands to:
 | ----------------------------------------------- | ---------------------------------------------- |
 | `go vet ./...`                                  | static checks                                  |
 | `go test ./... -race -count=1 -skip '^TestReq'` | full correctness suite under the race detector |
-| `go test ./internal/engine -run TestReq -v`     | SPEC §2 G1–G7 compliance (no race)             |
+| `go test ./internal/engine -run TestReq -v`     | SPEC §2 G1–G8 compliance (no race)             |
 
 `TestReq*` is intentionally excluded from the race pass — race
 instrumentation slows sync writes enough to flake the SPEC §2 G3 perf
@@ -181,7 +181,7 @@ Other targets:
 
 | Command                 | What it does                                                    |
 | ----------------------- | --------------------------------------------------------------- |
-| `make compliance`       | SPEC §2 G1–G7 with loose ceilings (default workload)            |
+| `make compliance`       | SPEC §2 G1–G8 with loose ceilings (default workload)            |
 | `make compliance-heavy` | Same with `LITTLEDB_HEAVY=1` — 1M keys, 5-minute mixed workload |
 | `make bench`            | Micro + per-op latency benchmarks                               |
 | `make help`             | The menu                                                        |
@@ -250,11 +250,25 @@ docs/ops.md            Operator runbook
 
 ## Replication (bonus)
 
-Replication is **not implemented**. It is deferred to a planned
-`bonus/replication` branch as an async single-leader design (see
-[docs/SPEC.md §6](docs/SPEC.md) for the integration point). `main` is
-intentionally single-node so the core flow ships without half-finished
-cluster code on the hot path.
+Replication **is implemented on this branch** (`bonus/replication`) as
+an async single-leader design (see [docs/SPEC.md §6](docs/SPEC.md) for
+the integration point). `main` remains intentionally single-node so the
+core flow ships without cluster code on the hot path.
+
+On this branch:
+
+- `little-db serve --enable-replication` runs a leader that streams
+  every committed batch to a single SUBSCRIBE'd follower.
+- `little-db serve --replica-of <leader-addr>` runs a read-only
+  follower; writes return `FOLLOWER_READ_ONLY` with the leader's addr.
+- `little-db promote --addr <follower>` performs manual failover:
+  drains the replication runner, flips the follower's gate to
+  writable, and is idempotent (second call returns `BAD_REQUEST`).
+- `TestReq8_ReplicationBonus` exercises the full leader → follower →
+  PROMOTE → former-follower-accepts-writes path end-to-end.
+- The [`scenarios/`](scenarios/) package contains 15 build-tagged
+  failure-mode demonstrations and 1M/10M-record volume tests; see
+  [scenarios/README.md](scenarios/README.md) for invocations.
 
 ---
 
