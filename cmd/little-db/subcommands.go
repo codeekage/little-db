@@ -462,7 +462,6 @@ func runPing(args []string, stdout, stderr io.Writer) int {
 // ---------------------------------------------------------------------
 // stats
 // ---------------------------------------------------------------------
-
 func runStats(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -484,6 +483,39 @@ func runStats(args []string, stdout, stderr io.Writer) int {
 		return classifyErr(err, stderr)
 	}
 	fmt.Fprintf(stdout, "key_count=%d bytes_on_disk=%d\n", keys, bytes)
+	return exitOK
+}
+
+// ---------------------------------------------------------------------
+// promote
+// ---------------------------------------------------------------------
+
+// runPromote sends a single PROMOTE frame to the target server, which
+// must be a follower (started with --replica-of). On OK the server is
+// now a writable leader. On BAD_REQUEST ("not a follower") the
+// operator pointed at the wrong host; the exit code path
+// (exitRemoteBad) and the FOLLOWER_READ_ONLY / BAD_REQUEST diagnostic
+// in stderr make that obvious.
+func runPromote(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("promote", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	co := registerConnFlags(fs)
+	if err := parseFlags(fs, args); err != nil {
+		return exitUsage
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "promote: takes no positional args")
+		return exitUsage
+	}
+	c, code := dialClient(co, stderr)
+	if code != exitOK {
+		return code
+	}
+	defer c.Close()
+	if err := c.Promote(); err != nil {
+		return classifyErr(err, stderr)
+	}
+	fmt.Fprintln(stdout, "promoted")
 	return exitOK
 }
 

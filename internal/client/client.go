@@ -248,6 +248,18 @@ func (c *Client) Stats() (keyCount, bytesOnDisk uint64, err error) {
 	return wire.DecodeStatsOK(body)
 }
 
+// Promote asks a follower to become a writable leader. Returns nil on
+// OK; a non-follower replies BAD_REQUEST ("not a follower") which
+// surfaces as *wire.RemoteError. The call is one PROMOTE frame with
+// no body.
+func (c *Client) Promote() error {
+	status, body, err := c.roundTripUnary(&wire.PromoteRequest{})
+	if err != nil {
+		return err
+	}
+	return statusToErr(status, body)
+}
+
 // ReadKeyRange streams (key, value) pairs in [start, end). Either bound
 // may be nil for open-ended. For each page, pageFn is invoked with the
 // decoded pairs; if pageFn returns false, the stream is abandoned and

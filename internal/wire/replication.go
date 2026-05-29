@@ -68,6 +68,7 @@ const (
 const (
 	OpReplicateSubscribe Op = 0x08
 	OpReplicateRecord    Op = 0x09
+	OpPromote            Op = 0x0A
 )
 
 // Replication status. Used by followers to reject writes with a payload
@@ -108,8 +109,7 @@ func WriteReplicateSubscribe(w io.Writer, resumeTag []byte) error {
 }
 
 // decodeReplicateSubscribe parses a REPLICATE_SUBSCRIBE body.
-func decodeReplicateSubscribe(body []byte) (*ReplicateSubscribeRequest, error) {
-	if len(body) < 4 {
+func decodeReplicateSubscribe(body []byte) (*ReplicateSubscribeRequest, error) {	if len(body) < 4 {
 		return nil, asProtocolErr("REPLICATE_SUBSCRIBE: truncated tag_len header (have %d, want >=4)", len(body))
 	}
 	tlen := binary.BigEndian.Uint32(body[0:4])
@@ -181,4 +181,34 @@ func ReadReplicateRecord(r io.Reader) ([]byte, error) {
 		return nil, asProtocolErr("expected REPLICATE_RECORD (0x%02x), got 0x%02x", uint8(OpReplicateRecord), tag)
 	}
 	return DecodeReplicateRecord(body)
+}
+
+// PromoteRequest flips a follower into a writable leader. The body is
+// empty; the server uses its FollowerMode state to decide whether the
+// request is meaningful. A leader that receives PROMOTE is rejected
+// with BAD_REQUEST so an operator pointing at the wrong host gets a
+// diagnostic instead of a silent no-op. After promotion the server
+// stops rejecting writes; the local engine has no notion of
+// leader/follower so no engine-side state changes. Re-enabling
+// replication on the new leader (so it can itself accept
+// REPLICATE_SUBSCRIBE) is out of scope for v0.1.0 — a manual failover
+// restarts the new leader process with --enable-replication when
+// re-replication is wanted.
+type PromoteRequest struct{}
+
+// Op implements Request.
+func (*PromoteRequest) Op() Op { return OpPromote }
+
+// WritePromote writes one PROMOTE request frame to w. Body is empty.
+func WritePromote(w io.Writer) error {
+	return WriteFrame(w, uint8(OpPromote), nil)
+}
+
+// decodePromote parses a PROMOTE body. The body must be empty;
+// any payload is a protocol error.
+func decodePromote(body []byte) (*PromoteRequest, error) {
+	if len(body) != 0 {
+		return nil, asProtocolErr("PROMOTE: expected empty body, got %d bytes", len(body))
+	}
+	return &PromoteRequest{}, nil
 }

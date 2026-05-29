@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -76,6 +77,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runStats(rest, stdout, stderr)
 	case "ping":
 		return runPing(rest, stdout, stderr)
+	case "promote":
+		return runPromote(rest, stdout, stderr)
 	case "-h", "--help", "help":
 		printUsage(stdout)
 		return exitOK
@@ -98,6 +101,7 @@ Subcommands:
   batch    Submit a batch (NDJSON on stdin with "-")
   stats    Print server stats
   ping     Health-check the server
+  promote  Flip a follower into a writable leader (manual failover)
 
 Run "little-db <subcommand> --help" for subcommand flags.`)
 }
@@ -245,7 +249,27 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		}
 	}()
 
-	srv := server.New(db, server.Options{
+	// Declare follower-side state up-front so the PROMOTE hook (set
+	// in server.Options below) can close over it. Cancelling
+	// followerCtx tears down the Follower runner. followerDone is
+	// closed when Run returns and is what the promote hook (and
+	// signal-shutdown drain) wait on — it has no value, so any
+	// number of receivers can observe it. followerErr is the
+	// "unexpected death" channel watched by the main select; the
+	// follower goroutine writes to it only when the exit was NOT
+	// caused by a promotion, so PROMOTE does not race the main
+	// select for the same value (a real bug surfaced in smoke
+	// testing: both sides received followerErr, main won, the hook
+	// hung, the PROMOTE client timed out, and the server shut
+	// itself down). When --replica-of is empty, the goroutine is
+	// never started and these channels are inert.
+	followerCtx, followerCancel := context.WithCancel(context.Background())
+	defer followerCancel()
+	followerErr := make(chan error, 1)
+	followerDone := make(chan struct{})
+	var promoted atomic.Bool
+
+	serverOpts := server.Options{
 		Addr:                      *addr,
 		ReadDeadline:              *readDeadline,
 		WriteDeadline:             *writeDeadline,
@@ -255,7 +279,30 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		FollowerMode:              *replicaOf != "",
 		LeaderAddr:                *replicaOf,
 		Logger:                    logger,
-	})
+	}
+	if *replicaOf != "" {
+		// OnPromote drains the follower BEFORE the server flips its
+		// read-only gate off. Without that ordering an in-flight
+		// ApplyReplicatedRecord could race the first post-promotion
+		// client write and break the lastTstamp ratchet. The store
+		// of `promoted` MUST happen before followerCancel: the
+		// follower goroutine checks `promoted` to decide whether to
+		// publish its terminal error on followerErr (which would
+		// trigger main's transport-exit case). Storing after cancel
+		// would let Run return between cancel and store, observe
+		// promoted=false, and kill the freshly promoted server.
+		serverOpts.OnPromote = func(ctx context.Context) error {
+			promoted.Store(true)
+			followerCancel()
+			select {
+			case <-followerDone:
+				return nil
+			case <-ctx.Done():
+				return fmt.Errorf("follower drain: %w", ctx.Err())
+			}
+		}
+	}
+	srv := server.New(db, serverOpts)
 	if err := srv.Bind(); err != nil {
 		fmt.Fprintf(stderr, "little-db serve: bind %s: %v\n", *addr, err)
 		return exitTransport
@@ -282,13 +329,18 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 	// can recover. Surfacing that error on followerErr lets the main
 	// select treat a dead follower the same as a dead listener: tear
 	// down the read-only server and exit non-zero, instead of serving
-	// stale data forever.
-	followerCtx, followerCancel := context.WithCancel(context.Background())
-	defer followerCancel()
-	followerErr := make(chan error, 1)
+	// stale data forever. PROMOTE consumes followerErr via the
+	// OnPromote hook wired into serverOpts above; after that, the
+	// main-select case on followerErr blocks forever (harmless).
 	if *replicaOf != "" {
 		follower := server.NewFollower(*replicaOf, db, server.FollowerOptions{Logger: logger})
-		go func() { followerErr <- follower.Run(followerCtx) }()
+		go func() {
+			err := follower.Run(followerCtx)
+			if !promoted.Load() {
+				followerErr <- err
+			}
+			close(followerDone)
+		}()
 	}
 
 	// Serve in a goroutine; signal handler triggers Shutdown.
@@ -311,7 +363,7 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		shutdownErr := srv.Shutdown(shutCtx)
 		<-serveErr
 		if *replicaOf != "" {
-			<-followerErr
+			<-followerDone
 		}
 		if shutdownErr != nil {
 			fmt.Fprintf(stderr, "little-db serve: shutdown: %v\n", shutdownErr)
@@ -322,7 +374,7 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		// Serve returned on its own — listener died unexpectedly.
 		followerCancel()
 		if *replicaOf != "" {
-			<-followerErr
+			<-followerDone
 		}
 		if err != nil {
 			fmt.Fprintf(stderr, "little-db serve: %v\n", err)
@@ -331,10 +383,12 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		return exitOK
 	case err := <-followerErr:
 		// Follower hit a terminal local-engine error (ErrDBClosed or
-		// ErrWritesDisabled). Keeping the read-only server up while
-		// no new records can ever be applied would serve
-		// monotonically staler data; better to exit non-zero and let
-		// the supervisor restart or alert.
+		// ErrWritesDisabled) WITHOUT a promotion. Keeping the
+		// read-only server up while no new records can ever be
+		// applied would serve monotonically staler data; better to
+		// exit non-zero and let the supervisor restart or alert.
+		// PROMOTE-driven exits are filtered out at the source (see
+		// the goroutine above).
 		stop()
 		fmt.Fprintf(stderr, "little-db serve: follower terminated: %v\n", err)
 		shutCtx, cancel := context.WithTimeout(context.Background(), *shutdownGrace)

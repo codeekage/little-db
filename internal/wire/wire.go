@@ -142,6 +142,8 @@ func (o Op) String() string {
 		return "REPLICATE_SUBSCRIBE"
 	case OpReplicateRecord:
 		return "REPLICATE_RECORD"
+	case OpPromote:
+		return "PROMOTE"
 	default:
 		return "UNKNOWN"
 	}

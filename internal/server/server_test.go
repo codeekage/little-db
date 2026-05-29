@@ -1335,3 +1335,128 @@ func TestFollowerRunReturnsOnDBClose(t *testing.T) {
 	}
 	t.Fatalf("Run did not return ErrDBClosed after follower DB close")
 }
+
+// --- 8. PROMOTE ----------------------------------------------------------
+
+// TestPromoteRejectsOnLeader: PROMOTE against a non-follower must
+// return BAD_REQUEST so misaimed operator invocations are obvious.
+func TestPromoteRejectsOnLeader(t *testing.T) {
+	_, addr := startServer(t, nil)
+	conn := dial(t, addr)
+	st, body := roundTrip(t, conn, &wire.PromoteRequest{})
+	if st != wire.StatusBadRequest {
+		t.Fatalf("got status %v want BAD_REQUEST", st)
+	}
+	msg, err := wire.DecodeError(body)
+	if err != nil {
+		t.Fatalf("DecodeError: %v", err)
+	}
+	if !bytes.Contains([]byte(msg), []byte("not a follower")) {
+		t.Fatalf("msg %q should mention 'not a follower'", msg)
+	}
+}
+
+// TestPromoteFlipsFollowerMode: write rejected → PROMOTE OK → write
+// accepted. Exercises the full atomic-flip path through dispatchOnce.
+func TestPromoteFlipsFollowerMode(t *testing.T) {
+	_, addr := startServer(t, func(o *Options) {
+		o.FollowerMode = true
+		o.LeaderAddr = "leader.example:4242"
+	})
+	conn := dial(t, addr)
+
+	st, _ := roundTrip(t, conn, &wire.PutRequest{Key: []byte("k"), Value: []byte("v")})
+	if st != wire.StatusFollowerReadOnly {
+		t.Fatalf("pre-PROMOTE PUT: got %v want FOLLOWER_READ_ONLY", st)
+	}
+
+	st, body := roundTrip(t, conn, &wire.PromoteRequest{})
+	if st != wire.StatusOK {
+		msg, _ := wire.DecodeError(body)
+		t.Fatalf("PROMOTE: got %v (%s) want OK", st, msg)
+	}
+
+	st, body = roundTrip(t, conn, &wire.PutRequest{Key: []byte("k"), Value: []byte("v")})
+	if st != wire.StatusOK {
+		msg, _ := wire.DecodeError(body)
+		t.Fatalf("post-PROMOTE PUT: got %v (%s) want OK", st, msg)
+	}
+}
+
+// TestPromoteRunsHookBeforeFlip: the hook must complete before
+// followerMode is cleared. Asserted by checking the hook ran AND a
+// subsequent PUT succeeds; the inverse (PUT before hook) cannot happen
+// because dispatchOnce reads the gate after the hook returns.
+func TestPromoteRunsHookBeforeFlip(t *testing.T) {
+	hookRan := make(chan struct{}, 1)
+	_, addr := startServer(t, func(o *Options) {
+		o.FollowerMode = true
+		o.LeaderAddr = "leader.example:4242"
+		o.OnPromote = func(ctx context.Context) error {
+			hookRan <- struct{}{}
+			return nil
+		}
+	})
+	conn := dial(t, addr)
+	st, _ := roundTrip(t, conn, &wire.PromoteRequest{})
+	if st != wire.StatusOK {
+		t.Fatalf("PROMOTE: got %v want OK", st)
+	}
+	select {
+	case <-hookRan:
+	default:
+		t.Fatal("OnPromote hook did not run")
+	}
+	st, _ = roundTrip(t, conn, &wire.PutRequest{Key: []byte("k"), Value: []byte("v")})
+	if st != wire.StatusOK {
+		t.Fatalf("post-PROMOTE PUT: got %v want OK", st)
+	}
+}
+
+// TestPromoteIdempotentSecondCall: sync.Once guards the flip, and the
+// second PROMOTE sees followerMode=false and returns BAD_REQUEST.
+func TestPromoteIdempotentSecondCall(t *testing.T) {
+	_, addr := startServer(t, func(o *Options) {
+		o.FollowerMode = true
+		o.LeaderAddr = "leader.example:4242"
+	})
+	conn := dial(t, addr)
+	if st, _ := roundTrip(t, conn, &wire.PromoteRequest{}); st != wire.StatusOK {
+		t.Fatalf("first PROMOTE: got %v want OK", st)
+	}
+	st, body := roundTrip(t, conn, &wire.PromoteRequest{})
+	if st != wire.StatusBadRequest {
+		t.Fatalf("second PROMOTE: got %v want BAD_REQUEST", st)
+	}
+	msg, _ := wire.DecodeError(body)
+	if !bytes.Contains([]byte(msg), []byte("not a follower")) {
+		t.Fatalf("second PROMOTE msg %q should say 'not a follower'", msg)
+	}
+}
+
+// TestPromoteHookErrorReturnsInternal: hook failure must surface as
+// INTERNAL and leave the server in follower mode so the operator can
+// retry without losing read-only safety.
+func TestPromoteHookErrorReturnsInternal(t *testing.T) {
+	_, addr := startServer(t, func(o *Options) {
+		o.FollowerMode = true
+		o.LeaderAddr = "leader.example:4242"
+		o.OnPromote = func(ctx context.Context) error {
+			return errors.New("drain failed")
+		}
+	})
+	conn := dial(t, addr)
+	st, body := roundTrip(t, conn, &wire.PromoteRequest{})
+	if st != wire.StatusInternal {
+		t.Fatalf("PROMOTE: got %v want INTERNAL", st)
+	}
+	msg, _ := wire.DecodeError(body)
+	if !bytes.Contains([]byte(msg), []byte("drain failed")) {
+		t.Fatalf("PROMOTE msg %q should include hook error", msg)
+	}
+	// Server must still reject writes.
+	st, _ = roundTrip(t, conn, &wire.PutRequest{Key: []byte("k"), Value: []byte("v")})
+	if st != wire.StatusFollowerReadOnly {
+		t.Fatalf("post-failed-PROMOTE PUT: got %v want FOLLOWER_READ_ONLY", st)
+	}
+}

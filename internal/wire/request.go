@@ -112,6 +112,8 @@ func DecodeRequest(op Op, body []byte) (Request, error) {
 		return &StatsRequest{}, nil
 	case OpReplicateSubscribe:
 		return decodeReplicateSubscribe(body)
+	case OpPromote:
+		return decodePromote(body)
 	default:
 		return nil, asProtocolErr("unknown opcode 0x%02x", uint8(op))
 	}
@@ -334,6 +336,8 @@ func encodeRequestBody(req Request) ([]byte, error) {
 		return nil, nil
 	case *ReplicateSubscribeRequest:
 		return EncodeReplicateSubscribe(r.ResumeTag)
+	case *PromoteRequest:
+		return nil, nil
 	default:
 		return nil, asProtocolErr("unknown request type %T", req)
 	}

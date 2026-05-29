@@ -110,6 +110,20 @@ type Options struct {
 	// dials it.
 	LeaderAddr string
 
+	// OnPromote runs once when the server transitions out of follower
+	// mode in response to a PROMOTE request. The hook MUST drain the
+	// follower runner (cancel its context and wait for Run to return)
+	// before returning, otherwise an in-flight ApplyReplicatedRecord
+	// could race with a freshly-accepted client write and break the
+	// engine's lastTstamp ratchet. A nil hook is treated as a no-op,
+	// which is only correct if the caller has no follower runner
+	// (e.g. tests that exercise the gate-flip in isolation). The hook
+	// runs synchronously on the request goroutine, so its error
+	// becomes the PROMOTE response: nil → OK, non-nil →
+	// StatusInternal with the error message. Bounded by the request
+	// ctx; hooks that do unbounded waits will deadlock the response.
+	OnPromote func(ctx context.Context) error
+
 	// Logger receives lifecycle events (listen, shutdown) at Info and,
 	// when Debug is enabled, one line per request (op, sizes, status,
 	// duration). Nil installs a no-op logger; the per-request hot path
@@ -150,6 +164,15 @@ type Server struct {
 
 	connsMu sync.Mutex
 	conns   map[net.Conn]struct{}
+
+	// followerMode is the live read-only gate. Mirrors
+	// Options.FollowerMode at construction time, then mutated by
+	// Promote so a running server can be flipped without a restart.
+	// Read on the per-request hot path; the atomic is cheaper than a
+	// mutex and the only writer is the PROMOTE handler under
+	// promoteOnce.
+	followerMode atomic.Bool
+	promoteOnce  sync.Once
 }
 
 // New constructs a Server bound to db. Options defaults are applied.
@@ -169,7 +192,7 @@ func New(db *engine.DB, opts Options) *Server {
 	if opts.Logger == nil {
 		opts.Logger = logging.Nop()
 	}
-	return &Server{
+	s := &Server{
 		opts:       opts,
 		db:         db,
 		log:        opts.Logger,
@@ -178,6 +201,8 @@ func New(db *engine.DB, opts Options) *Server {
 		shutdownCh: make(chan struct{}),
 		conns:      make(map[net.Conn]struct{}),
 	}
+	s.followerMode.Store(opts.FollowerMode)
+	return s
 }
 
 // Bind opens the TCP listener. Must be called exactly once, before Serve.
@@ -445,7 +470,7 @@ func (s *Server) dispatchOnce(conn net.Conn, req wire.Request) (wire.Status, err
 	// timestamp ratchet. The mutating opcodes are listed explicitly
 	// (rather than a default-rejecting fallthrough) so a future
 	// read-only opcode does not need to remember to opt in.
-	if s.opts.FollowerMode {
+	if s.followerMode.Load() {
 		switch req.(type) {
 		case *wire.PutRequest, *wire.DeleteRequest, *wire.BatchRequest:
 			msg := "follower read-only"
@@ -505,9 +530,52 @@ func (s *Server) dispatchOnce(conn net.Conn, req wire.Request) (wire.Status, err
 
 	case *wire.ReplicateSubscribeRequest:
 		return s.handleReplicateSubscribe(conn, r)
+
+	case *wire.PromoteRequest:
+		return s.handlePromote(conn)
 	}
 	// Unknown concrete type; defensive.
 	return wire.StatusInternal, s.writeError(conn, wire.StatusInternal, "unknown request type")
+}
+
+// handlePromote flips this server out of follower mode in response to
+// an operator PROMOTE request. It is idempotent in the sense that a
+// PROMOTE against an already-promoted server returns BAD_REQUEST
+// ("not a follower") rather than another OK, so a script that sends
+// PROMOTE to the wrong host learns about it.
+//
+// The actual drain (cancelling the Follower runner and waiting for its
+// goroutine to exit) lives in the OnPromote hook supplied by the
+// caller. Ordering — drain BEFORE flipping the gate — is essential:
+// the moment followerMode is false, dispatchOnce starts forwarding
+// writes to the engine, and any in-flight ApplyReplicatedRecord on
+// the follower side would land concurrently and corrupt the
+// lastTstamp ratchet. sync.Once guards the hook so two simultaneous
+// PROMOTE requests can't both run it.
+func (s *Server) handlePromote(conn net.Conn) (wire.Status, error) {
+	if !s.followerMode.Load() {
+		return wire.StatusBadRequest, s.writeError(conn, wire.StatusBadRequest, "not a follower")
+	}
+	var hookErr error
+	s.promoteOnce.Do(func() {
+		if hook := s.opts.OnPromote; hook != nil {
+			// Bound the hook by the server's write deadline so a
+			// stuck follower drain can't pin the request goroutine
+			// forever. The connection itself already has the same
+			// deadline armed by handleConn for the response write.
+			ctx, cancel := context.WithTimeout(context.Background(), s.opts.WriteDeadline)
+			defer cancel()
+			hookErr = hook(ctx)
+		}
+		if hookErr == nil {
+			s.followerMode.Store(false)
+			s.log.Info("server promoted: follower mode disabled")
+		}
+	})
+	if hookErr != nil {
+		return wire.StatusInternal, s.writeError(conn, wire.StatusInternal, "promote: "+hookErr.Error())
+	}
+	return wire.StatusOK, s.writeFrame(conn, uint8(wire.StatusOK), nil)
 }
 
 // handleRange streams a READKEYRANGE response. Concurrency is bounded by
