@@ -18,7 +18,8 @@ package engine_test
 // promotes the loose default assertions into the SPEC numbers.
 // LITTLEDB_DATASET_GIB controls the §4 dataset size (default 8 GiB).
 //
-// G8 (replication) is bonus per §14 Batch 8 and is skipped here.
+// G8 (replication) is bonus per §14 Batch 8 and is exercised end-to-end
+// by TestReq8_ReplicationBonus on this branch.
 
 import (
 	"context"
@@ -37,6 +38,7 @@ import (
 	"little-db/internal/client"
 	"little-db/internal/engine"
 	"little-db/internal/server"
+	"little-db/internal/wire"
 )
 
 // ---------------------------------------------------------------------
@@ -650,9 +652,185 @@ func TestReq7_NetworkAvailable(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------
-// G8 — Replication: bonus, deferred to SPEC §14 Batch 8.
+// G8 — Replication: SPEC §2 G8 (bonus). End-to-end check that a leader
+// streams writes to a follower, the follower rejects writes while a
+// follower, and a manual PROMOTE flips it into a writable leader. This
+// is the same shape the operator runbook in docs/replication.md
+// documents — the test is the runbook.
 // ---------------------------------------------------------------------
 
 func TestReq8_ReplicationBonus(t *testing.T) {
-	t.Skip("G8 replication is bonus per SPEC §14 Batch 8; deferred")
+	// Leader: writable, replication enabled.
+	leaderDir := t.TempDir()
+	leaderDB, err := engine.Open(engine.Options{
+		Dir:                   leaderDir,
+		MaxBatchEncodedSize:   16 * 1024 * 1024,
+		ReplicationBufferSize: 64,
+	})
+	if err != nil {
+		t.Fatalf("leader engine.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = leaderDB.Close() })
+
+	leaderSrv := server.New(leaderDB, server.Options{
+		Addr:                      "127.0.0.1:0",
+		ReadDeadline:              2 * time.Second,
+		WriteDeadline:             2 * time.Second,
+		MaxConcurrentRangeStreams: 4,
+		MaxRangeResponseBytes:     64 * 1024 * 1024,
+		EnableReplication:         true,
+	})
+	if err := leaderSrv.Bind(); err != nil {
+		t.Fatalf("leader Bind: %v", err)
+	}
+	leaderAddr := leaderSrv.Addr().String()
+	leaderServeErr := make(chan error, 1)
+	go func() { leaderServeErr <- leaderSrv.Serve() }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = leaderSrv.Shutdown(ctx)
+		<-leaderServeErr
+	})
+
+	// Follower engine + read-only server. The replication runner
+	// (server.NewFollower) pulls from the leader and applies into
+	// followerDB. The OnPromote hook here mirrors what the CLI does
+	// in cmd/little-db/main.go: cancel the runner, wait for it to
+	// exit cleanly, then let the server flip the gate.
+	followerDir := t.TempDir()
+	followerDB, err := engine.Open(engine.Options{
+		Dir:                 followerDir,
+		MaxBatchEncodedSize: 16 * 1024 * 1024,
+	})
+	if err != nil {
+		t.Fatalf("follower engine.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = followerDB.Close() })
+
+	runnerCtx, runnerCancel := context.WithCancel(context.Background())
+	t.Cleanup(runnerCancel)
+	runner := server.NewFollower(leaderAddr, followerDB, server.FollowerOptions{
+		InitialBackoff:      10 * time.Millisecond,
+		MaxBackoff:          100 * time.Millisecond,
+		SubscribeAckTimeout: 2 * time.Second,
+	})
+	runnerDone := make(chan error, 1)
+	runnerExited := make(chan struct{})
+	go func() {
+		runnerDone <- runner.Run(runnerCtx)
+		close(runnerExited)
+	}()
+
+	followerSrv := server.New(followerDB, server.Options{
+		Addr:                      "127.0.0.1:0",
+		ReadDeadline:              2 * time.Second,
+		WriteDeadline:             2 * time.Second,
+		MaxConcurrentRangeStreams: 4,
+		MaxRangeResponseBytes:     64 * 1024 * 1024,
+		FollowerMode:              true,
+		LeaderAddr:                leaderAddr,
+		OnPromote: func(ctx context.Context) error {
+			runnerCancel()
+			select {
+			case <-runnerExited:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	})
+	if err := followerSrv.Bind(); err != nil {
+		t.Fatalf("follower Bind: %v", err)
+	}
+	followerAddr := followerSrv.Addr().String()
+	followerServeErr := make(chan error, 1)
+	go func() { followerServeErr <- followerSrv.Serve() }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = followerSrv.Shutdown(ctx)
+		<-followerServeErr
+	})
+
+	// Clients.
+	clientOpts := client.Options{
+		DialTimeout:    2 * time.Second,
+		RequestTimeout: 2 * time.Second,
+	}
+	leaderCli, err := client.Dial(leaderAddr, clientOpts)
+	if err != nil {
+		t.Fatalf("dial leader: %v", err)
+	}
+	t.Cleanup(func() { _ = leaderCli.Close() })
+	followerCli, err := client.Dial(followerAddr, clientOpts)
+	if err != nil {
+		t.Fatalf("dial follower: %v", err)
+	}
+	t.Cleanup(func() { _ = followerCli.Close() })
+
+	// (1) Replication: PUT on the leader, then GET on the follower
+	// must see the value. The leader's publisher drops records when
+	// no subscriber is attached, so a one-shot PUT can race the
+	// SUBSCRIBE handshake; loop the PUT until the follower observes
+	// (same pattern as server-package waitForApplied).
+	key := []byte("g8/replicated")
+	val := []byte("from-leader")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if err := leaderCli.Put(key, val); err != nil {
+			t.Fatalf("leader Put: %v", err)
+		}
+		got, gerr := followerCli.Get(key)
+		if gerr == nil && string(got) == string(val) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("follower never observed replicated key: err=%v got=%q", gerr, got)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// (2) Follower rejects writes with FOLLOWER_READ_ONLY.
+	if err := followerCli.Put([]byte("g8/should-fail"), []byte("x")); err == nil {
+		t.Fatal("follower PUT should have failed")
+	} else {
+		var remote *wire.RemoteError
+		if !errors.As(err, &remote) || remote.Status != wire.StatusFollowerReadOnly {
+			t.Fatalf("follower PUT err: want StatusFollowerReadOnly, got %v", err)
+		}
+	}
+
+	// (3) Manual failover: PROMOTE flips the gate. The hook cancels
+	// the replication runner, waits for it to exit, then the server
+	// clears followerMode and returns OK.
+	if err := followerCli.Promote(); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	select {
+	case rerr := <-runnerDone:
+		if rerr != nil && !errors.Is(rerr, context.Canceled) {
+			t.Fatalf("runner exit: %v", rerr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner did not exit after promotion")
+	}
+
+	// (4) Former follower is now a writable leader: PUT succeeds and
+	// the value is independently readable (proves the gate actually
+	// flipped and the engine is intact post-drain).
+	postKey := []byte("g8/post-promote")
+	postVal := []byte("from-promoted")
+	if err := followerCli.Put(postKey, postVal); err != nil {
+		t.Fatalf("post-promote Put: %v", err)
+	}
+	got, err := followerCli.Get(postKey)
+	if err != nil {
+		t.Fatalf("post-promote Get: %v", err)
+	}
+	if string(got) != string(postVal) {
+		t.Fatalf("post-promote Get: got %q want %q", got, postVal)
+	}
+
+	t.Logf("G8 replication + manual failover OK: leader=%s follower=%s", leaderAddr, followerAddr)
 }
